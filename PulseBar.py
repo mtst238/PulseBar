@@ -38,8 +38,11 @@
                        した窓に覆われる。覆われたバーの露出端やバー本体をクリック
                        すると前面へ出る（実測: muffin は override-redirect を常に
                        最前面へ回すため、この挙動には WM管理+飾りなしが必要）。
-               前面固定時、バーがパネル帯に重なる場合は更新tick毎(約1秒)に帯の
-               オーバレイ(stage)窓の直上へ積層を作り直し、常にクリックが取れる。
+               前面固定時、バーがパネル帯に重なる場合は「ポインタがバー矩形上に
+               あり帯のオーバレイ窓(幽霊窓)が入力を握っている間だけ」帯の窓の直上へ
+               積層を作り直し、クリックが取れるようにする（無条件の毎tick再主張は
+               Cinnamon のホバー・ポップアップを打ち消すため廃止。代償として他窓に
+               覆われた直後はマウスがバーに乗るまで1tick遅れで前面化される）。
       dock   = 下端パネル帯の中に同一高さで埋め込む（帯の上端にドッキングし、
                帯の高さ＝自動高さで帯の内側に収まる）。帯のアプリレットと
                重ならない位置は dock_offset_x で調整。帯のポインタ入力は
@@ -63,7 +66,7 @@
       dock_auto(dock で true=既定: 帯右側アプレット群の直前に自動右寄せ。
       false: dock_offset_x 固定),
       dock_offset_x(プライマリモニタ左端からのオフセット px),
-      dock_height(0=パネル帯の高さに自動（PANEL_H が取れない環境のみセル高さ既定46）、
+      dock_height(0=パネル帯の高さに自動（PANEL_H が取れない環境のみセル高さ既定40）、
       下限34), geometry(gadget の [x,y])。
   - 対応OS: Linux (X11)。動作確認済みは Linux Mint 22.3 (Cinnamon/muffin) のみ。
     他ディストリビューションでは未検証。Windows は非対応（撤去）。Wayland 未対応。
@@ -217,8 +220,8 @@ NET_LAST = [0.0, 0]       # [前値秒, 前値(sent+recv bytes)] (net_io_counter
 DISK_LAST = [0.0, 0]      # [前値秒, 前値(read+write bytes)] (disk_io_counters 差分用)
 
 PAD = 6
-CELL_W = 82               # 1セルの幅
-CELL_H = 46               # 1セルの高さ（gadget 用）
+CELL_W = 60               # 1セルの幅
+CELL_H = 40               # 1セルの高さ（gadget 用）
 
 BG = "#15171c"
 FG = "#d8dee9"
@@ -977,6 +980,7 @@ def request_skip_taskbar():
 
 
 class Bar:
+    REASSERT_GRACE_S = 1.5  # 最後の再主張後、この時間だけ restack を継続（ホバー離れの余韻）
 
     def __init__(self, root, mets, cfg):
         global PANEL_H
@@ -1156,7 +1160,17 @@ class Bar:
         クリックを握るコンポジタ・オーバレイ窓の直上へ自分を作り直す。これをしないと
         帯上にドラッグ配置した後、帯内の右クリックが stage 窓に取られて
         バーを選択できない（実測: query_pointer の child が stage になる）。
-        重なり中は毎呼び出し無条件に作り直す（後発窓にも勝ち続け常時選択可能に）。
+        ただし「無条件に毎 tick restack」は Cinnamon のホバー・ポップアップ
+        （ウィンドウ一覧のサムネイル等）を毎秒打ち消す（実測回归）。restack は
+        「実需があるときだけ」:
+          - ポインタがバー矩形（∩帯）の上にあり、なおかつ入力オーナーが自分
+            以外（=帯の幽霊窓に取られている）ときだけ restack する。
+          - オーナーが自クライアント（Tk メニュー等、id>>21 が同じ）なら restack しない。
+          - 最後に restack してから REASSERT_GRACE_S(1.5s) は猶予して継続 restack
+            （ポップアップ展開直後にポインタが一瞬バー縁に留まるケース対策）。
+        代償: 他窓に覆われた直後は、マウスがバーに乗るまで 1 tick 遅れで前面化
+        される（実操作ではマウスを寄せてからクリックするので許容）。
+        オーバレイ窓はツリーに出ないことがあるため、ポインタがバー∩帯の上にある
         ときは query_pointer の入力オーナーで真の相手を見つけてキャッシュする。"""
         if not self._or_mode:
             return
@@ -1177,11 +1191,21 @@ class Bar:
             px, py, owner = probe
             if owner is not None and (owner >> 21) == (win.id >> 21):
                 return  # 自分自身（Tkメニュー等のポップアップ）には勝たせない
-            if (owner is not None and owner != win.id and
-                    (owner >> 21) == (win.id >> 21)):
-                return  # 自分自身（Tkメニュー等のポップアップ）には勝たせない
-            if owner is not None and owner != win.id:
+            on_bar = (bx <= px < bx + self.w and
+                      max(by, band_top) <= py < by + self.h)
+            if on_bar and owner is not None and owner != win.id:
                 _hidden_thief = owner  # 帯の入力を握っている幽霊窓の ID
+            now = time.monotonic()
+            need = on_bar and owner is not None and owner != win.id
+            prev = getattr(self, "_reassert_prev_a", False)
+            if need and not prev:
+                self._reassert_at = None  # ポインタがバー上へ入った立上り: 即再主張
+            self._reassert_prev_a = need
+            if not need:
+                return  # 実需なし: ポップアップ（他窓）が上でも restack しない
+            last = getattr(self, "_reassert_at", None)
+            if last is not None and now - last >= self.REASSERT_GRACE_S:
+                return  # 連続要求が猶予(1.5s)を超過: restack を絞る
             if restack_above_stage(win, thief=_hidden_thief):
                 self._reassert_at = now
         except Exception:
