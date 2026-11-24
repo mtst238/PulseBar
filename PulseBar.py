@@ -1,0 +1,1404 @@
+#!/usr/bin/env python3
+"""PulseBar: CPU/GPU/メモリ/VRAM の使用率・電力・温度をコンパクトに監視するデスクトップガジェット。
+
+仕様（正本はこの docstring）:
+  - 監視項目（config.json の "items" で表示/非表示を選ぶ、順序はこの順）:
+      cpu=CPU使用率, gpu=GPU使用率, ram=メモリ使用率, vram=VRAM使用率,
+      power=GPU電力(W), temp=GPU温度(℃), cputemp=CPU温度(℃, k10temp/coretemp),
+      cpupower=CPUパッケージ電力(W, RAPL=powercap energy_uj差分。有効化には
+      enable_cpu_power.sh を sudo で1回実行。run.sh は energy_uj が読めない時
+      だけ自動で pkexec/sudo 起動する)。
+      fan=GPUファン回転(%, NVML FanSpeed の全デバイス max。既定 off)。
+      cfrg=CPU周波数(MHz, psutil cpu_freq。既定 off)。
+      net=ネットワークスループット(MB/s, sent+recv の1秒差分。既定 off)。
+      disk=ディスクI/Oスループット(MB/s, read+write の1秒差分。既定 off)。
+      ssdtemp=SSD温度(℃, nvme Composite 優先/無ければ hwmon nvme temp1_input。
+      既定 off)。
+      NVIDIA GPU がない場合は cpu/ram/cputemp/cpupower/cfrg/net/disk のみ
+      選択可。センサーが無い項目は選択不可。
+  - 1項目1セルで「上段=ラベル+現在値 / 下段=波形」を並べる。
+    数値=今の値を正確に読むため、波形=過去からの推移を直感的に把握するため。
+    波形線から波形帯下端までは水平帯分割+色ブレンドの縦グラデで塗り、
+    線付近が濃く下端で背景色に溶ける（塗り色は波形線と同じ負荷色に追随）。
+  - 更新間隔 1 秒、波形の表示範囲は約 60 秒（リングバッファ HISTORY 点）。
+  - 波形の縦スケール: %系と温度は 0-100 固定。電力はバッファ内の最大値と
+    POWER_FLOOR の大きい方で自動スケール。同じ自動スケール機構を CPU周波数
+    (下限 CFRG_FLOOR=1000MHz) とネット/ディスクスループット
+    (下限 IO_FLOOR=10MB/s) にも使う。
+  - 高負荷の強調: 値が warn 超で数値・波形・セル枠が警告色(橙)、crit 超で危険色(赤)。
+      cpu/gpu/ram: warn 80% crit 93% / vram: warn 90% crit 95% /
+      temp: warn 75℃ crit 88℃ / power: GPU電力上限の warn 80% crit 95%。
+  - 表示モード（config.json の "mode"）:
+      gadget = 画面前面に浮かぶコンパクトバー。左ドラッグで移動、位置は
+               config.json の geometry に保存。
+               "orient": "h"=セル横1列 / "v"=セル縦1列。
+               "topmost": true/false で積層の方針を選ぶ。
+               true  = 最前面固定（override-redirect で全ウィンドウの上）。
+               false = アクティブ順。他のアプリと同じ扱いで、後からアクティブに
+                       した窓に覆われる。覆われたバーの露出端やバー本体をクリック
+                       すると前面へ出る（実測: muffin は override-redirect を常に
+                       最前面へ回すため、この挙動には WM管理+飾りなしが必要）。
+               前面固定時、バーがパネル帯に重なる場合は更新tick毎(約1秒)に帯の
+               オーバレイ(stage)窓の直上へ積層を作り直し、常にクリックが取れる。
+      dock   = 下端パネル帯の中に同一高さで埋め込む（帯の上端にドッキングし、
+               帯の高さ＝自動高さで帯の内側に収まる）。帯のアプリレットと
+               重ならない位置は dock_offset_x で調整。帯のポインタ入力は
+               コンポジタ(Cinnamon stage窓)が握るが、必要時の積層再主張
+               （maybe_reassert_stack + 幽霊窓検出）で入力を取れる。常に横1列。
+               X11 の DOCK タイプを設定（STRUT は予約しない＝作業領域を変えない）。
+               dock_auto=true（既定）なら dock_offset_x を使わず、Cinnamon の
+               D-BusEval で測る帯右側アプレット群の直前（余白6px）にバー幅で
+               右寄せ自動配置（起動時と5秒ごとに再計算、失敗時は最後の位置維持）。
+  - 操作: 右クリックでメニュー（項目名は英語）。
+      View: いま出ていない方へ切替のみ（ガジェット中は "Dock"、
+            パネル中は "Gadget"。現在の表示形式の選択肢は出さない）。
+            以下はガジェット時のみ: "Always on top" と、配置の切り替え先のみ
+            （横配置中は "Vertical"、縦配置中は "Horizontal"）。
+      Items: 表示中なら "Hide <name>"、非表示なら "Show <name>"
+             （最後の1項目は非表示にできない）。
+      "Quit"。外部からも `kill -USR1 <pid>` で gadget/dock 切替。Esc で終了。
+  - config.json キー: mode(gadget|dock), items(項目キー->true/false),
+      order(表示順: 項目キーの並べ替えで表示位置を変える。右クリックメニューでは
+      変更せずこのファイルを編集する), topmost, orient(h|v),
+      dock_auto(dock で true=既定: 帯右側アプレット群の直前に自動右寄せ。
+      false: dock_offset_x 固定),
+      dock_offset_x(プライマリモニタ左端からのオフセット px),
+      dock_height(0=パネル帯の高さに自動（PANEL_H が取れない環境のみセル高さ既定46）、
+      下限34), geometry(gadget の [x,y])。
+  - 対応OS: Linux (X11)。動作確認済みは Linux Mint 22.3 (Cinnamon/muffin) のみ。
+    他ディストリビューションでは未検証。Windows は非対応（撤去）。Wayland 未対応。
+  - GPU は NVML の全デバイスを1系統に集計して表示する
+    （使用率=max, VRAM=合計使用/合計搭載, 電力=合計, 温度=max）。
+    検証用フック: PULSEBAR_NO_GPU=1 / PULSEBAR_NO_SENSORS=1 で GPU無し・
+    センサー無し構成を再現できる。
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+
+import tkinter as tk
+from tkinter import Menu
+
+import psutil
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+DEFAULT_CONFIG = {
+    "mode": "gadget",
+    "items": {"cpu": True, "gpu": True, "ram": True, "vram": True, "power": True,
+              "cpupower": True, "temp": True, "cputemp": True,
+              "fan": False, "cfrg": False, "net": False, "disk": False,
+              "ssdtemp": False},
+    "order": ["cpu", "gpu", "ram", "vram", "cpupower", "power", "cputemp", "temp",
+              "fan", "cfrg", "net", "disk", "ssdtemp"],
+    "topmost": True,
+    "orient": "h",
+    "dock_auto": True,
+    "dock_offset_x": 0,
+    "dock_height": 0,
+    "geometry": None,
+}
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    # マルチGPU対応: 全デバイスを収集し、集計して1系統として表示する
+    #   gpu使用率=max, vram=sum(used)/sum(total), 電力=sum, 温度=max
+    GPUS = [pynvml.nvmlDeviceGetHandleByIndex(i)
+            for i in range(pynvml.nvmlDeviceGetCount())]
+except Exception:
+    GPUS = []
+
+# 検証フック: PULSEBAR_NO_GPU=1 で「GPUが無いPC」、
+# PULSEBAR_NO_SENSORS=1 で「GPU/CPU温度/CPU電力センサー全て無し構成」を模す。
+if os.environ.get("PULSEBAR_NO_GPU") or os.environ.get("PULSEBAR_NO_SENSORS"):
+    GPUS = []
+
+
+def find_cpu_temp_chip():
+    """CPU ダイ温度の (チップ名, センサーlabel) を探す（AMD=k10temp/Tctl,
+    Intel=coretemp/Tdie Package）。見つからなければ None。"""
+    try:
+        temps = psutil.sensors_temperatures()
+    except Exception:
+        return None
+    for chip in ("k10temp", "coretemp", "zenpower"):
+        entries = temps.get(chip)
+        if not entries:
+            continue
+        for e in entries:
+            lab = e.label or ""
+            if lab in ("Tctl", "Tdie", "Package id 0", "Tdie Package", ""):
+                return chip, lab
+    return None
+
+
+CPU_CHIP = find_cpu_temp_chip()  # ("k10temp","Tctl") 等 / 無ければ None
+if os.environ.get("PULSEBAR_NO_SENSORS"):
+    CPU_CHIP = None  # 検証フック: CPU温度センサー無し構成を模す
+
+
+def find_cpu_power_source():
+    """CPU パッケージ電力の読み出し経路を返す。
+    1) hwmon の power1_input (amd_energy / k10temp 等, 単位 µW)
+    2) powercap の energy_uj (RAPL 系, エネルギー積算から 1 秒差分を W に換算)
+    見つからなければ None。"""
+    import glob
+    # 1) hwmon power1_input
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            name = open(d + "/name").read().strip()
+            v = int(open(d + "/power1_input").read().strip())
+            if v > 0:
+                return ("hwmon", d, name)
+        except (OSError, ValueError):
+            continue
+    # 2) powercap energy_uj（読み取れる場合のみ）
+    for d in sorted(glob.glob("/sys/class/powercap/*")):
+        if ":" not in os.path.basename(d) and "rapl" not in os.path.basename(d):
+            continue
+        try:
+            open(d + "/energy_uj").read()
+            return ("rapl", d, "package")
+        except OSError:
+            continue
+    return None
+
+
+CPU_POWER = find_cpu_power_source()
+if os.environ.get("PULSEBAR_NO_SENSORS"):
+    CPU_POWER = None  # 検証フック: CPU電力センサー無し構成を模す
+CPU_POWER_LAST = [0, 0.0]  # [energy_uj 前値秒, 前値uJ] (rapl 用)
+
+
+def find_ssd_temp_source():
+    """SSD温度の読み出し経路を返す。
+    1) psutil.sensors_temperatures()['nvme'] の Composite（label が Composite か
+       label 空で "Composite" を含むもの）
+    2) /sys/class/hwmon/*/name が nvme の temp1_input (m℃)
+    見つからなければ None。"""
+    import glob
+    if not os.environ.get("PULSEBAR_NO_SENSORS"):
+        try:
+            entries = psutil.sensors_temperatures().get("nvme") or []
+        except Exception:
+            entries = []
+        for e in entries:
+            lab = e.label or ""
+            if lab == "Composite" or "Composite" in lab or lab == "":
+                return ("psutil", lab)  # tick毎に nvme から読み直す（label で照合）
+    if not os.environ.get("PULSEBAR_NO_SENSORS"):
+        for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            try:
+                if open(d + "/name").read().strip() != "nvme":
+                    continue
+                v = int(open(d + "/temp1_input").read().strip())
+                if v > 0:
+                    return ("hwmon", d)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+SSD_TEMP = find_ssd_temp_source()
+
+INTERVAL_MS = 1000        # 更新間隔
+HISTORY = 60              # 波形点数（=約60秒分）
+POWER_FLOOR = 100.0       # 電力スケールの下限 (W)
+CFRG_FLOOR = 1000.0       # CPU周波数スケールの下限 (MHz)
+IO_FLOOR = 10.0           # ネット/ディスクI/Oスケールの下限 (MB/s)
+MB = 1024.0 * 1024.0      # 1MB
+
+NET_LAST = [0.0, 0]       # [前値秒, 前値(sent+recv bytes)] (net_io_counters 差分用)
+DISK_LAST = [0.0, 0]      # [前値秒, 前値(read+write bytes)] (disk_io_counters 差分用)
+
+PAD = 6
+CELL_W = 82               # 1セルの幅
+CELL_H = 46               # 1セルの高さ（gadget 用）
+
+BG = "#15171c"
+FG = "#d8dee9"
+OK = "#8f97a7"       # 通常時の描画色（項目固有色ではなく負荷段階で色分けするため）
+GRID = "#2a2e37"
+WARN = "#ffb86c"   # warn 超
+CRIT = "#ff4444"   # crit 超
+
+PANEL_H = 0               # 起動時に測った下端パネルの高さ
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg["items"] = dict(DEFAULT_CONFIG["items"])
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k == "items" and isinstance(v, dict):
+                cfg["items"].update({ik: iv for ik, iv in v.items() if ik in cfg["items"]})
+            elif k in cfg:
+                cfg[k] = v
+            else:
+                # DEFAULT_CONFIG に無いキーでも保持する（過去に geometry 消失事件：
+                # 未知キーを保存時に落とすとユーザー設定が消える）
+                cfg[k] = v
+    except Exception:
+        pass
+    if cfg.get("mode") == "float":
+        cfg["mode"] = "gadget"  # 旧設定名
+    # order: 未知キー除去 + 新項目は末尾に補う（未設定なら DEFAULT の順）
+    keys = list(DEFAULT_CONFIG["items"])
+    cur = cfg.get("order") or DEFAULT_CONFIG["order"]
+    cfg["order"] = [k for k in cur if k in keys] + \
+                   [k for k in keys if k not in cur]
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+class Metric:
+    def __init__(self, key, label, unit, color, fmt="{:.0f}", gpu_only=False,
+                 warn=None, crit=None):
+        self.key = key
+        self.label = label
+        self.unit = unit
+        self.color = color
+        self.fmt = fmt
+        self.gpu_only = gpu_only
+        self.warn = warn          # これ超で警告色（None=無効）
+        self.crit = crit          # これ超で危険色
+        self.buf = deque([0.0] * HISTORY, maxlen=HISTORY)
+        self.fixed_max = 100.0  # %系と温度は0-100固定、電力・周波数・S/I/OはNoneで自動スケール
+        self.floor = POWER_FLOOR  # 自動スケール時のスケール下限（項目ごとに設定）
+        self.compact_g = False    # MB/s系: 1000超で GB/s に繰り上げ '1.2G' 表示
+        self.no_sensor = False  # このPCにセンサーが無い（表示不可）
+
+    def unavailable(self):
+        return (self.gpu_only and not GPUS) or self.no_sensor
+
+    def level(self):
+        """現在値の負荷段階: 0=通常 1=警告 2=危険。"""
+        v = self.buf[-1]
+        if self.crit is not None and v >= self.crit:
+            return 2
+        if self.warn is not None and v >= self.warn:
+            return 1
+        return 0
+
+    def ui_color(self):
+        """描画色は負荷段階のみで決める（項目固有色は背景の淡色にのみ使う）。"""
+        lv = self.level()
+        return CRIT if lv == 2 else WARN if lv == 1 else OK
+
+    def push(self, v):
+        self.buf.append(v)
+
+    def value_text(self):
+        v = self.buf[-1]
+        if v is None:
+            return "--"
+        if self.compact_g and v >= 1000.0:
+            return "{:.1f}G".format(v / 1000.0)  # MB/s -> GB/s 繰り上げ
+        return self.fmt.format(v) + self.unit
+
+    def polyline(self, gx0, gx1, top, bot):
+        span = bot - top - 2
+        vmax = self.fixed_max if self.fixed_max else max(max(self.buf), self.floor)
+        pts = []
+        for j, v in enumerate(self.buf):
+            x = gx0 + (gx1 - gx0) * j / (HISTORY - 1)
+            y = bot - 1 - span * min(max(v / vmax, 0.0), 1.0)
+            pts += [x, y]
+        return pts
+
+
+def fill_bands(pts, top, bot, bands=8):
+    """折れ線頂点 pts=[x0,y0,x1,y1,...] から下端 bot までの塗り帯を
+    上端側から順に返す。各帯は水平帯 [ya,yb] に対し「線 y を [ya,yb] に
+    クリップした上面境界 + 帯下端 yb」の多角形頂点リスト。折れ線が帯より
+    上に出る/下に入る部分も矩形化されず正しく欠ける。"""
+    xs, ys = pts[0::2], pts[1::2]
+    step = (bot - top) / bands
+    out = []
+    for k in range(bands):
+        ya = top + step * k
+        yb = ya + step
+        poly = []
+        for x, y in zip(xs, ys):
+            poly += [x, min(max(y, ya), yb)]
+        for x in reversed(xs):
+            poly += [x, yb]
+        out.append(poly)
+    return out
+
+
+def blend(c1, c2, t):
+    """#rrggbb 2色を t 割で混ぜた色を返す（背景の下色作り用）。"""
+    a = tuple(int(c1[i:i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(c2[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(x * (1 - t) + y * t) for x, y in zip(a, b))
+
+
+def power_limits():
+    """GPU の電力上限合計 (W)。全デバイスから取得、取れなければ None。"""
+    if not GPUS:
+        return None
+    total = None
+    for gpu in GPUS:
+        for fn in (pynvml.nvmlDeviceGetPowerManagementLimit,
+                   pynvml.nvmlDeviceGetEnforcedPowerLimit):
+            try:
+                w = fn(gpu) / 1e3  # mW -> W
+                if w > 0:
+                    total = (total or 0.0) + w
+                    break
+            except Exception:
+                continue
+    return total
+
+
+def build_metrics():
+    plim = power_limits()
+    mets = {
+        "cpu": Metric("cpu", "CPU", "%", "#88c0d0", warn=80, crit=93),
+        "gpu": Metric("gpu", "GPU", "%", "#ebcb8b", gpu_only=True, warn=80, crit=93),
+        "ram": Metric("ram", "RAM", "%", "#a3be8c", warn=80, crit=93),
+        "vram": Metric("vram", "VRAM", "%", "#b48ead", gpu_only=True, warn=90, crit=95),
+        "power": Metric("power", "GPWR", "W", "#d08770", gpu_only=True,
+                        warn=None if plim is None else plim * 0.80,
+                        crit=None if plim is None else plim * 0.95),
+        "temp": Metric("temp", "GTMP", "C", "#bf616a", gpu_only=True, warn=75, crit=88),
+        "cputemp": Metric("cputemp", "CTMP", "C", "#5e81ac", warn=80, crit=95),
+        "cpupower": Metric("cpupower", "CPWR", "W", "#e3738c",
+                           warn=90, crit=140),
+        "fan": Metric("fan", "FAN", "%", "#8fbcbb", gpu_only=True,
+                      warn=70, crit=90),
+        "cfrg": Metric("cfrg", "CFRG", "M", "#81a1c1"),
+        "net": Metric("net", "NET", "M", "#57c7a5"),
+        "disk": Metric("disk", "DISK", "M", "#d8973c"),
+        "ssdtemp": Metric("ssdtemp", "STMP", "C", "#e8e060", warn=65, crit=75),
+    }
+    if CPU_CHIP is None:
+        mets["cputemp"].no_sensor = True  # CPU温度センサーが無い場合は選択不可扱い
+    else:
+        mets["cputemp"].chip, mets["cputemp"].tlabel = CPU_CHIP
+    if CPU_POWER is None:
+        mets["cpupower"].no_sensor = True  # CPU電力センサーが無い場合は選択不可扱い
+    else:
+        mets["cpupower"].fixed_max = None  # CPU電力も自動スケール
+    if SSD_TEMP is None:
+        mets["ssdtemp"].no_sensor = True  # SSD温度センサーが無い場合は選択不可扱い
+    else:
+        mets["ssdtemp"].kind, mets["ssdtemp"].spath = SSD_TEMP
+    mets["power"].fixed_max = None  # 電力のみ自動スケール
+    # 周波数とスループットは 0-100 固定に収まらないので電力と同じ自動スケール
+    # （バッファ最大値と floor の大きい方でスケール）
+    mets["cfrg"].fixed_max = None
+    mets["cfrg"].floor = CFRG_FLOOR
+    for k in ("net", "disk"):
+        mets[k].fixed_max = None
+        mets[k].floor = IO_FLOOR
+        mets[k].compact_g = True  # >=1000 MB/s は GB/s に繰り上げ '1.2G'
+    return mets
+
+
+def sample_gpu(mets):
+    """複数GPUは1系統に集計して表示する:
+    使用率=max(全GPU), VRAM=sum(used)/sum(total), 電力=sum, 温度=max。
+    デバイス単位の取得失敗はスキップ（一部欠けても止めない）。"""
+    if not GPUS:
+        return
+    utils, psum, temps, fans = [], 0.0, [], []
+    used = tot = 0
+    for gpu in GPUS:
+        try:
+            utils.append(float(pynvml.nvmlDeviceGetUtilizationRates(gpu).gpu))
+        except Exception:
+            pass
+        try:
+            fans.append(float(pynvml.nvmlDeviceGetFanSpeed(gpu)))
+        except Exception:
+            pass
+        try:
+            mem = pynvml.nvmlDeviceGetMemoryInfo(gpu)
+            used += mem.used
+            tot += mem.total
+        except Exception:
+            pass
+        try:
+            psum += pynvml.nvmlDeviceGetPowerUsage(gpu) / 1e3  # mW -> W
+        except Exception:
+            pass
+        try:
+            temps.append(float(pynvml.nvmlDeviceGetTemperature(
+                gpu, pynvml.NVML_TEMPERATURE_GPU)))
+        except Exception:
+            pass
+    if utils:
+        mets["gpu"].push(max(utils))
+    if fans:
+        mets["fan"].push(max(fans))  # ファン回転は fan の max（温度と同じ方針）
+    if tot > 0:
+        mets["vram"].push(100.0 * used / tot)
+    mets["power"].push(psum)
+    if temps:
+        mets["temp"].push(max(temps))
+
+
+def sample_cpu(mets):
+    mets["cpu"].push(psutil.cpu_percent(interval=None))
+    mets["ram"].push(psutil.virtual_memory().percent)
+    m = mets.get("cputemp")
+    if m is not None and hasattr(m, "chip"):
+        try:
+            for e in psutil.sensors_temperatures().get(m.chip, []):
+                if (e.label or "") == m.tlabel:
+                    m.push(float(e.current))
+                    break
+        except Exception:
+            pass
+    m = mets.get("cpupower")
+    if m is not None and CPU_POWER is not None:
+        kind, path, _name = CPU_POWER
+        try:
+            if kind == "hwmon":  # µW
+                w = int(open(path + "/power1_input").read().strip()) / 1e6
+            else:  # rapl: energy_uj 差分 / 経過秒
+                import time as _t
+                now, e = _t.monotonic(), float(open(path + "/energy_uj").read().strip())
+                dt, de = now - CPU_POWER_LAST[0], e - CPU_POWER_LAST[1]
+                CPU_POWER_LAST[0], CPU_POWER_LAST[1] = now, e
+                w = (de / 1e6 / dt) if dt > 0 and de >= 0 else 0.0  # µJ/s = µW
+            m.push(w)
+        except Exception:
+            pass
+    m = mets.get("cfrg")
+    if m is not None:
+        try:
+            f = psutil.cpu_freq()
+            if f is not None and f.current:
+                m.push(float(f.current))
+        except Exception:
+            pass
+    m = mets.get("net")
+    if m is not None:
+        try:
+            import time as _t
+            c = psutil.net_io_counters()
+            now, tot = _t.monotonic(), c.bytes_sent + c.bytes_recv
+            dt, de = now - NET_LAST[0], tot - NET_LAST[1]
+            NET_LAST[0], NET_LAST[1] = now, tot
+            m.push((de / MB / dt) if dt > 0 and de >= 0 else 0.0)  # MB/s
+        except Exception:
+            pass
+    m = mets.get("disk")
+    if m is not None:
+        try:
+            import time as _t
+            c = psutil.disk_io_counters()
+            if c is None:
+                raise OSError("disk_io_counters unavailable")
+            now, tot = _t.monotonic(), c.read_bytes + c.write_bytes
+            dt, de = now - DISK_LAST[0], tot - DISK_LAST[1]
+            DISK_LAST[0], DISK_LAST[1] = now, tot
+            m.push((de / MB / dt) if dt > 0 and de >= 0 else 0.0)  # MB/s
+        except Exception:
+            pass
+    m = mets.get("ssdtemp")
+    if m is not None and SSD_TEMP is not None:
+        kind, path = SSD_TEMP
+        try:
+            if kind == "psutil":
+                for e in psutil.sensors_temperatures().get("nvme", []):
+                    if (e.label or "") == path:
+                        m.push(float(e.current))
+                        break
+            else:  # hwmon: m℃ -> ℃
+                m.push(int(open(path + "/temp1_input").read().strip()) / 1000.0)
+        except Exception:
+            pass
+
+
+def monitor_geom(primary=True):
+    """xrandr からプライマリ（または最初の接続）モニタの (x, 幅, 高さ) を返す。"""
+    try:
+        out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if " connected" not in line:
+            continue
+        if primary != (" primary" in line):
+            continue
+        m = re.search(r"(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+        if m:
+            w, h, x, _y = (int(v) for v in m.groups())
+            return x, w, h
+    return None
+
+
+# --- dock_auto: Cinnamon パネル帯の未使用領域にバーを自動配置 ---------------
+# D-BusEval で panelManager の _leftBox/_rightBox 子アプレットの矩形を取り、
+# 帯右側アプレット列の先頭xと左側末端xを取得（この機の Cinnamon 6.6.9 で
+# get_transformed_box は actor に存在せず get_allocation_box は親相対だった
+# ため、panel actor の絶対x + box の子相対を足して絶対座標に直す）。
+PANEL_BOUNDS_JS = (
+    "var pm = imports.ui.main.panelManager;"
+    "var panels = pm.panels.filter(function(p){ return !!p; });"
+    "if (panels.length === 0) throw 'no panels';"
+    "var bottom = panels[0], by = -1;"
+    "for (var i = 0; i < panels.length; i++) {"
+    "  var b = panels[i].actor.get_allocation_box();"
+    "  if (b.y1 >= by) { by = b.y1; bottom = panels[i]; } }"
+    "var pa = bottom.actor.get_allocation_box();"
+    "var rb = bottom._rightBox.get_allocation_box();"
+    "var lb = bottom._leftBox.get_allocation_box();"
+    "var rightStart = null;"
+    "var ch = bottom._rightBox.get_children();"
+    "for (var j = 0; j < ch.length; j++) {"
+    "  try { var a = ch[j].get_allocation_box();"
+    "    if (a.x2 - a.x1 <= 0) continue;"
+    "    var x = pa.x1 + rb.x1 + a.x1;"
+    "    if (rightStart === null || x < rightStart) rightStart = x; } catch (e) {} }"
+    "if (rightStart === null) rightStart = pa.x2;"
+    "var leftEnd = null;"
+    "ch = bottom._leftBox.get_children();"
+    "for (var k = 0; k < ch.length; k++) {"
+    "  try { var a2 = ch[k].get_allocation_box();"
+    "    if (a2.x2 - a2.x1 <= 0) continue;"
+    "    var x2 = pa.x1 + lb.x1 + a2.x2;"
+    "    if (leftEnd === null || x2 > leftEnd) leftEnd = x2; } catch (e) {} }"
+    "if (leftEnd === null) leftEnd = pa.x1;"
+    "JSON.stringify([rightStart, leftEnd]);"
+)
+
+
+def cinnamon_panel_bounds():
+    """帯右側アプレット列の先頭xと左側末端xを [rightStart, leftEnd] で返す。
+    Cinnamon 以外・失敗時（gdbus timeout 2s）は None。"""
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.Cinnamon",
+             "--object-path", "/org/Cinnamon", "--method",
+             "org.Cinnamon.Eval", PANEL_BOUNDS_JS],
+            capture_output=True, text=True, timeout=2).stdout
+        # 戻りは (true, '[..]') 形式。末尾の JSON 配列を拾う。
+        m = re.search(r"\[\s*\d+\s*,\s*\d+\s*\]", out)
+        if not m:
+            return None
+        v = json.loads(m.group(0))
+        return [int(v[0]), int(v[1])]
+    except Exception:
+        return None
+
+
+def measure_panel_height(root):
+    """_NET_WORKAREA から下端パネルの高さを推定（取れなければ 0）。"""
+    try:
+        out = subprocess.run(["xprop", "-root", "_NET_WORKAREA"],
+                             capture_output=True, text=True, timeout=5).stdout
+        nums = [int(v) for v in re.findall(r"-?\d+", out.split(":")[-1])]
+        sh = root.winfo_screenheight()
+        for i in range(0, len(nums) - 3, 4):
+            _x, y, _w, h = nums[i:i + 4]
+            if sh - (y + h) > 0:
+                return sh - (y + h)
+    except Exception:
+        pass
+    return 0
+
+
+def find_my_window():
+    """Xlib で自分のトップレベルウィンドウ（wm_class に pulsebar）を返す。"""
+    from Xlib import display
+    d = display.Display()
+    stack = [d.screen().root]
+    while stack:
+        w = stack.pop()
+        try:
+            kids = w.query_tree().children
+        except Exception:
+            continue
+        for c in kids:
+            try:
+                cls = c.get_wm_class()
+            except Exception:
+                cls = None
+            if cls and "pulsebar" in (cls[0] + cls[1]).lower():
+                return d, c
+            stack.append(c)
+    return d, None
+
+
+def _find_desktop_window(d):
+    """壁紙を描くデスクトップウィンドウ（クラス名に desktop を含むもの）を探す。"""
+    stack = [d.screen().root]
+    while stack:
+        w = stack.pop()
+        for c in w.query_tree().children:
+            try:
+                cls = c.get_wm_class()
+            except Exception:
+                continue
+            if cls and "desktop" in (cls[0] + cls[1]).lower():
+                return c
+            stack.append(c)
+    return None
+
+
+def apply_bounding_shape(win, w, h, dock):
+    """常に通常長方形（張り出し機構は撤去済み。将来の形状変更用に残す）。"""
+    try:
+        from Xlib.ext import shape
+        win.shape_rectangles(shape.ShapeBounding, shape.ShapeSet, 0, 0, 0,
+                             [(0, 0, w, h)])
+    except Exception:
+        pass
+
+
+def set_window_role(dock, w, h, x, y, above=True):
+    """dock=True なら DOCK タイプ+下端 STRUT を設定、False ならそれらを削除。
+    above=True なら最上位に積む。above=False は他ウィンドウのウラ面へ下げるが、
+    壁紙ウィンドウの下に潜ると見えなくなるため、壁紙の直上（＝アプリ全員のウラ）に
+    restack する。壁紙が見つからなければ単体で最背面。"""
+    try:
+        from Xlib import X as Xc
+        d, win = find_my_window()
+        if win is None:
+            return False
+        a_type = d.intern_atom("_NET_WM_WINDOW_TYPE")
+        xa_atom = d.intern_atom("ATOM")  # 型アトム ATOM (id 4)。Xlib.X.ATOM は存在しない
+        if dock:
+            # DOCK タイプのみ。STRUT は予約しない——ドックはパネル帯の内側に
+            # 重なるため、追加予約すると作業領域が二重に縮む（ウィンドウがずれる）。
+            win.change_property(a_type, xa_atom, 32,
+                                [d.intern_atom("_NET_WM_WINDOW_TYPE_DOCK")])
+        else:
+            win.delete_property(a_type)
+            win.delete_property(d.intern_atom("_NET_WM_STRUT_PARTIAL"))
+            win.delete_property(d.intern_atom("_NET_WM_STRUT"))
+        apply_bounding_shape(win, w, h, dock)
+        # override-redirect のウィンドウは WM のスタック管理外なので、
+        # 自前でスタック操作しないとウラ面へ行けない。
+        if above or dock:
+            win.configure(stack_mode=Xc.Above)
+        else:
+            desk = _find_desktop_window(d)
+            if desk is not None:
+                win.configure(stack_mode=Xc.Above, sibling=desk)
+            else:
+                win.configure(stack_mode=Xc.Below)
+        d.flush()
+        return True
+    except Exception:
+        return False
+
+
+def clear_dock_role():
+    """_NET_WM_WINDOW_TYPE / STRUT を削除する（ドック→ガジェット戻し用）。"""
+    try:
+        d, win = find_my_window()
+        if win is None:
+            return False
+        for name in ("_NET_WM_WINDOW_TYPE", "_NET_WM_STRUT_PARTIAL", "_NET_WM_STRUT"):
+            try:
+                win.delete_property(d.intern_atom(name))
+            except Exception:
+                pass
+        d.flush()
+        return True
+    except Exception:
+        return False
+
+
+def _stage_windows(d, win):
+    """コンポジタ(Cinnamon/muffin)の全画面オーバレイ窓候補（下端パネル帯の
+    ポインタ入力を握る窓）を、積層の上位(末尾=前面)順に返す。
+    条件: override-redirect で画面の下端～中央まで覆う大きさ。
+    自分のウィンドウツリー（自窓・その親・兄弟）は除外する。"""
+    out = []
+    try:
+        root = d.screen().root
+        # python-xlib の Screen に height/width は無い（昔 scr.height を見ていて
+        # AttributeError で常に空振りだった）。root の geometry から取る。
+        rw, rh = root.get_geometry().width, root.get_geometry().height
+        par = win.query_tree().parent
+        mine = {win.id} | ({par.id} if par is not None else set())
+        cands = list(root.query_tree().children)
+        if par is not None and par.id != root.id:
+            cands += [c for c in par.query_tree().children if c.id not in mine]
+        for c in cands:
+            if c.id in mine:
+                continue
+            try:
+                a = c.get_attributes()
+                if not a.override_redirect:
+                    continue
+                g = c.get_geometry()
+            except Exception:
+                continue
+            if (g.x <= 0 and g.y <= rh // 2 and
+                    g.x + g.width >= rw and
+                    g.y + g.height >= rh - 5):
+                out.append(c)
+        return out
+    except Exception:
+        return []
+
+
+# パネル帯領域でポインタ入力を握るコンポジタ窓は、ウィンドウツリーに現れない
+# ことがある（実測: 0x1d8 は restack の sibling に名前を挙げるまで query_tree の
+# どの子にも出ない）。query_pointer で帯上の入力の真のオーナーを測り、その ID を
+# here にキャッシュして sibling に使う。
+_hidden_thief = None
+
+
+def force_above(win, other):
+    """ Below→Above の二段 restack で、積層順に「変化」を作ってから other の直上に
+    積む。muffin は同じ位置への no-op configure だと入力ルーティングを再同期せず、
+    真に上下が入れ替わる操作のときだけ追従する（実測: query_pointer の owner が
+    0x1d8 のまま積む操作は空振り、Below→Above で反転し以降tickで保持）。"""
+    try:
+        d = win.display
+        Xc = __import__("Xlib").X
+        win.configure(stack_mode=Xc.Below, sibling=other)
+        d.sync()
+        win.configure(stack_mode=Xc.Above, sibling=other)
+        d.sync()
+        return True
+    except Exception:
+        return False
+
+
+def _pointer_owner(d):
+    """query_pointer でポインタ位置と、そこで入力を受けている窓の ID を返す
+    (root_x, root_y, child_id|None)。失敗時 None。"""
+    try:
+        qp = d.screen().root.query_pointer()
+        c = qp.child
+        c = c if isinstance(c, int) else (c.id if c else 0)
+        return qp.root_x, qp.root_y, (c or None)
+    except Exception:
+        return None
+
+
+# --- バー下ドラッグ: 押下点真下の最前面の他窓と WM 管理フレームを探す ------
+# query_pointer の root 点から root.query_tree()（積層の下端=背面順）を上へ辿り、
+# 点を含み・bar_base の client に属さず・override-redirect でなく・
+# パネル/デスクトップ/stage でない窓まで最深の子へ下りる。そこから WM_STATE /
+# _NET_WM_PID のある最も外側の root 直下祖先（=muffin のフレーム）へ遡って
+# 移動対象にする（子だけ configure すると内容が切れるため）。
+
+def _type_excluded(d, w):
+    """DOCK/DESKTOP/stage/パネル系の窓なら True（動かしてはいけない窓）。"""
+    try:
+        from Xlib import X as _X
+        t = w.get_full_property(d.intern_atom("_NET_WM_WINDOW_TYPE"),
+                                _X.AnyPropertyType)
+        if t:
+            names = {d.get_atom_name(v) for v in t.value}
+            if names & {"_NET_WM_WINDOW_TYPE_DOCK", "_NET_WM_WINDOW_TYPE_DESKTOP",
+                        "_NET_WM_WINDOW_TYPE_DOCK_MENU", "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+                        "_NET_WM_WINDOW_TYPE_POPUP_MENU", "_NET_WM_WINDOW_TYPE_TOOLTIP",
+                        "_NET_WM_WINDOW_TYPE_SPLASH"}:
+                return True
+    except Exception:
+        pass
+    try:
+        cls = w.get_wm_class()
+    except Exception:
+        cls = None
+    blob = " ".join(cls).lower() if cls else ""
+    return any(s in blob for s in ("desktop", "panel", "stage", "cinnamon",
+                                   "muffin", "plank", "dock"))
+
+
+def climb_window(d, root, win):
+    """押下点最深窓から移動・raise 対象を特定し (frame, managed) を返す。
+    frame = 祖先鎖の最も外側（root 直下）の祖先（reparent 済みなら WM フレーム窓、
+    CSD で直下なら自分）。configure 移動はこれを対象にしないと子だけ動いて
+    内容がフレームに切り抜かれる。managed = 鎖の中で WM_STATE / _NET_WM_PID を
+    持つ窓（=WM に管理されている証拠であり、_NET_ACTIVE_WINDOW の送信先）。
+    managed が無い鎖（オーバレイ/パネルの子・管理外）は None。"""
+    from Xlib import X as _X
+    xa_pid = d.intern_atom("_NET_WM_PID")
+    xa_wmstate = d.intern_atom("WM_STATE")
+
+    def managed(w):
+        try:
+            # Window.get_property は 4 引数必須。get_full_property を使う
+            return (w.get_full_property(xa_wmstate, _X.AnyPropertyType) is not None
+                    or w.get_full_property(xa_pid, _X.AnyPropertyType) is not None)
+        except Exception:
+            return False
+
+    if win is None:
+        return None
+    try:
+        if win.get_attributes().override_redirect:
+            return None
+    except Exception:
+        return None
+    target = win if managed(win) else None
+    top = win
+    w = win
+    for _ in range(32):
+        try:
+            par = w.query_tree().parent
+            if par is None or par.id == root.id:
+                break
+            if par.get_attributes().override_redirect or _type_excluded(d, par):
+                return None  # オーバレイ/パネルの子として埋まっている窓
+        except Exception:
+            break
+        if managed(par):
+            target = target or par
+            top = par
+        w = par
+    if target is None:
+        # 鎖のどこにも WM_STATE/_NET_WM_PID が無い = WM 管理外。移動対象にしない
+        return None
+    # frame は最も外側の root 直下祖先（フレーム）。managed は管理窓そのもの。
+    return (top, target)
+
+
+def outermost_ancestor(d, root, win):
+    """管理窓から最も外側の root 直下祖先（WM フレーム）を返す（自らが直下なら自分）。
+    raise のフォールバック（Above configure）はフレーム窓に当てる必要があるため。"""
+    top = win
+    w = win
+    for _ in range(32):
+        try:
+            par = w.query_tree().parent
+            if par is None or par.id == root.id:
+                break
+            top = par
+            w = par
+        except Exception:
+            break
+    return top
+
+
+def restack_above_stage(win, thief=None):
+    """帯上のポインタ入力を握るコンポジタ・オーバレイ窓の直上に自分を積む。
+    query_pointer で実測した入力オーナー（ツリーに出ないことがある最強候補）を
+    優先し、ダメならツリーに現れる全画面オーバレイ窓の直上へ積む。
+    （実測: override-redirect のスタック操作は muffin に無視されないこと、
+    真の thief 0x1d8 は sibling に挙げるまでツリーへ出ないこと。）"""
+    try:
+        d = win.display
+        Xc = __import__("Xlib").X
+        cands = []
+        if thief is not None:
+            cands.append((True, d.create_resource_object("window", thief)))
+        for c in reversed(_stage_windows(d, win)):  # 積層の上位順
+            if thief is not None and c.id == thief:
+                continue
+            cands.append((False, c))
+        for is_thief, st in cands:
+            if force_above(win, st):
+                return True
+            global _hidden_thief
+            if is_thief:
+                _hidden_thief = None  # 死んだIDなら捨ててツリー候補で再試行
+        return False
+    except Exception:
+        pass
+    return False
+
+
+def raise_or_below(above):
+    """自分の積層を再主張する。WM管理時は WM のフレーム側を restack する。
+    最前面指定時は、コンポジタの全画面オーバレイ窓（帯のクリックを握る）の
+    直上にも積む（帯に重なる位置で右クリックが届くように）。"""
+    try:
+        from Xlib import X as Xc
+        d, win = find_my_window()
+        if win is None:
+            return
+        target = win
+        try:
+            a = win.get_attributes()
+            if not a.override_redirect:
+                par = win.query_tree().parent
+                if par is not None and par.id != d.screen().root.id:
+                    target = par
+        except Exception:
+            pass
+        target.configure(stack_mode=Xc.Above if above else Xc.Below)
+        if above:
+            restack_above_stage(target)
+        d.flush()
+    except Exception:
+        pass
+
+
+def apply_motif_nodecor():
+    """_MOTIF_WM_HINTS でタイトルバー等の飾りを消す（マップ前に効かせる）。"""
+    try:
+        d, win = find_my_window()
+        if win is None:
+            return False
+        motif = d.intern_atom("_MOTIF_WM_HINTS")
+        win.change_property(motif, motif, 32, [2, 0, 0, 0, 0])  # decorations=0
+        d.flush()
+        return True
+    except Exception:
+        return False
+
+
+def request_skip_taskbar():
+    """WM へ _NET_WM_STATE の SKIP_TASKBAR / SKIP_PAGER を要求する（マップ後に送る）。
+    積層はアクティブ順（通常の管理ウィンドウと同じ）に任せるため BELOW は要求しない。"""
+    try:
+        from Xlib import X as Xc
+        from Xlib.protocol import event
+        d, win = find_my_window()
+        if win is None:
+            return False
+        nws = d.intern_atom("_NET_WM_STATE")
+        for atom in ("_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"):
+            ev = event.ClientMessage(
+                window=win, client_type=nws, data=(32, [1, d.intern_atom(atom), 0, 0, 0]))
+            win.send_event(ev, event_mask=Xc.SubstructureNotifyMask | Xc.SubstructureRedirectMask)
+        d.flush()
+        return True
+    except Exception:
+        return False
+
+
+class Bar:
+
+    def __init__(self, root, mets, cfg):
+        global PANEL_H
+        self.all_mets = mets                      # key -> Metric（常に全項目サンプル）
+        self.root = root
+        self.cfg = cfg
+        PANEL_H = measure_panel_height(root)
+        self.geom = monitor_geom(True) or monitor_geom(False) \
+            or (0, root.winfo_screenwidth(), root.winfo_screenheight())
+        root.overrideredirect(True)
+        root.attributes("-topmost", bool(cfg.get("topmost", True)))
+        try:
+            root.attributes("-alpha", 0.92)
+        except tk.TclError:
+            pass
+        # topmost off のガジェットだけ WM管理（飾りなし）にする。override-redirect の
+        # ママでは WM(muffin) が常に最前面層へ回してウラ面へ行けない（実測）。
+        self._or_mode = self.dock or bool(cfg.get("topmost", True))
+        if not self._or_mode:
+            root.overrideredirect(False)
+            apply_motif_nodecor()  # マップ前に飾りなしヒントを渡す
+        self.w = self.h = 0
+        # dock_auto: 帯右側アプレット列の先頭x・左側末端x [rightStart, leftEnd]。
+        # 起動時と5秒ごとに gdbus で更新（失敗時は最後の位置を維持）。
+        self._pbounds = None
+        self._auto_tick = 0
+        if self.dock and self.cfg.get("dock_auto", True):
+            self._pbounds = cinnamon_panel_bounds()
+        self.relayout(first=True)
+        root.configure(bg=BG)
+        self.cv = tk.Canvas(root, width=self.w, height=self.h, bg=BG, highlightthickness=0)
+        self.cv.pack()
+        root.bind("<Button-1>", self._grab)
+        root.bind("<B1-Motion>", self._drag)
+        root.bind("<Button-3>", self._open_menu)
+        root.bind("<Escape>", lambda e: root.destroy())
+        self._menu = None
+
+    # ---- 状態ヘルパ -------------------------------------------------------
+    @property
+    def dock(self):
+        return self.cfg["mode"] == "dock"
+
+    def visible_mets(self):
+        return [self.all_mets[k] for k in self.cfg.get("order", self.all_mets)
+                if k in self.all_mets
+                and self.cfg["items"].get(k) and not self.all_mets[k].unavailable()]
+
+    def _dock_h(self):
+        # 自動高さはパネル帯の高さ基準（帯の中に同一高さで埋め込むため）。
+        # ユーザー設定値(dock_height>0)を優先し、下限34。PANEL_H が取れない
+        # 環境でのみ CELL_H にフォールバック。
+        return max(self.cfg["dock_height"] or PANEL_H or CELL_H, 34)
+
+    def _cell(self):
+        """(セル横幅, セル縦幅) を layout から返す。dock は常に横。"""
+        return (CELL_W, self._dock_h() if self.dock else CELL_H)
+
+    # ---- サイズ・位置 -----------------------------------------------------
+    def relayout(self, first=False, keep_pos=True):
+        """mode/orient/items 変更後にウィンドウサイズと位置を作り直す。"""
+        mets = self.visible_mets()
+        n = max(len(mets), 1)
+        cw, ch = self._cell()
+        vertical = (not self.dock) and self.cfg.get("orient") == "v"
+        if vertical:
+            self.w, self.h = cw, ch * n
+        elif self.dock:
+            self.w, self.h = cw * n + PAD, ch
+        else:
+            self.w, self.h = cw * n + PAD, ch
+        self.vertical = vertical
+        self.top_off = 0
+        old_x, old_y = self.root.winfo_x(), self.root.winfo_y()
+        if self.dock:
+            x, y = self._dock_pos()
+        elif first and self.cfg.get("geometry"):
+            x, y = self._clamp_float(*self.cfg["geometry"][:2])
+        elif first:
+            x, y = self.geom[0] + self.geom[1] - self.w - 12, 12  # プライマリ右上
+        elif keep_pos:
+            x, y = self._clamp_float(old_x, old_y)
+        else:
+            x, y = self._clamp_float(old_x, old_y)
+        self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
+        if hasattr(self, "cv"):
+            self.cv.configure(width=self.w, height=self.h)
+        self.root.update_idletasks()
+        if not self._or_mode:
+            apply_motif_nodecor()
+            request_skip_taskbar()
+        else:
+            set_window_role(self.dock, self.w, self.h, x, y,
+                            above=self.dock or bool(self.cfg.get("topmost", True)))
+
+    def _clamp_float(self, x, y):
+        """ガジェットの位置をプライマリモニタ内に収める。
+        パネル帯の上に置くこともできる（その場合、帯に重なる部分は右クリックが
+        届かなくなるが、ユーザーが自分で配置する分には許容する運用）。"""
+        mx, mw, mh = self.geom
+        x = max(mx, min(x, mx + mw - self.w))
+        y = max(0, min(y, mh - self.h))
+        return x, y
+
+    def _dock_pos(self):
+        # ドックはパネル帯の中に埋め込む（帯の上端に窓の上端を合わせ、自動高さは
+        # 帯の高さ＝窓が帯にぴったり収まる）。帯のポインタ入力を握る幽霊窓には
+        # 必要時の積層再主張（maybe_reassert_stack）で勝つ。STRUT は予約しない
+        # （作業領域を変えない）。
+        mx, mw, mh = self.geom
+        y = mh - (PANEL_H or 40)
+        if self.cfg.get("dock_auto", True) and self._pbounds:
+            # 自動配置: 帯右側アプレット群の直前（余白6px）にバー幅で右寄せ。
+            # 左側アプレット群より左には出さない（重なり防止）。
+            right_start, left_end = self._pbounds
+            x = right_start - PAD - self.w
+            x = max(mx + PAD, x, left_end + PAD)
+            x = max(mx, min(x, mx + mw - self.w))
+        else:
+            x = mx + self.cfg["dock_offset_x"]
+            x = max(mx, min(x, mx + mw - self.w))
+        return x, y
+
+    def refresh_dock_auto(self):
+        """dock_auto 時に帯アプレットの縁を取り直し、位置が変わっていれば窓だけ
+        動かす（geometry 更新は changed 時のみ。gdbus 失敗時は最後の位置を維持＝
+        Cinnamon 以外では dock_offset_x フォールバック）。"""
+        if not (self.dock and self.cfg.get("dock_auto", True)):
+            return
+        b = cinnamon_panel_bounds()
+        if b is not None:
+            self._pbounds = b
+        x, y = self._dock_pos()
+        if (self.root.winfo_x(), self.root.winfo_y()) != (x, y):
+            self.root.geometry(f"+{x}+{y}")
+
+    def after_show(self):
+        # マップ後にスタック・装飾の設定を当てる（__init__ 時はマップ前で空振りする）。
+        # MOTIF decorations=0 はマップ後に当てない限り muffin に無視される（実測）。
+        if not self.dock and not self._or_mode:
+            clear_dock_role()
+            apply_motif_nodecor()
+            request_skip_taskbar()
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        set_window_role(self.dock, self.w, self.h, x, y,
+                        above=self.dock or bool(self.cfg.get("topmost", True)))
+        self.maybe_reassert_stack()
+
+    def _apply_layer_mode(self):
+        """override-redirect（前面固定/dock）と WM管理（ウラ面可）を切り替える。
+        overrideredirect の変更はマップ込みで作り直す必要がある。"""
+        want = self.dock or bool(self.cfg.get("topmost", True))
+        if want == self._or_mode:
+            return
+        root = self.root
+        pos = (root.winfo_x(), root.winfo_y())
+        root.withdraw()
+        root.overrideredirect(want)
+        self._or_mode = want
+        if not want:
+            apply_motif_nodecor()
+        root.attributes("-topmost", want and bool(self.cfg.get("topmost", True)))
+        root.deiconify()
+        root.geometry(f"+{pos[0]}+{pos[1]}")
+        root.update_idletasks()
+        # overrideredirect 切替で X ウィンドウが作り直されうるので、マップ完了後に
+        # 属性（DOCK タイプ/STRUT/装飾/スタック）を一度遅延再適用する
+        root.after(800, self.after_show)
+
+    # ---- 操作 -------------------------------------------------------------
+    def _grab(self, e):
+        self._ox, self._oy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
+
+    def maybe_reassert_stack(self):
+        """前面固定モード（dock 含む）でバーが下端パネル帯に重なっているとき、帯の
+        クリックを握るコンポジタ・オーバレイ窓の直上へ自分を作り直す。これをしないと
+        帯上にドラッグ配置した後、帯内の右クリックが stage 窓に取られて
+        バーを選択できない（実測: query_pointer の child が stage になる）。
+        重なり中は毎呼び出し無条件に作り直す（後発窓にも勝ち続け常時選択可能に）。
+        ときは query_pointer の入力オーナーで真の相手を見つけてキャッシュする。"""
+        if not self._or_mode:
+            return
+        mh = self.geom[2]
+        band_top = mh - (PANEL_H or 40)
+        d = None
+        try:
+            bx, by = self.root.winfo_x(), self.root.winfo_y()
+            if by + self.h <= band_top:
+                return
+            d, win = find_my_window()
+            if win is None:
+                return
+            global _hidden_thief
+            probe = _pointer_owner(d)
+            if probe is None:
+                return
+            px, py, owner = probe
+            if owner is not None and (owner >> 21) == (win.id >> 21):
+                return  # 自分自身（Tkメニュー等のポップアップ）には勝たせない
+            if (owner is not None and owner != win.id and
+                    (owner >> 21) == (win.id >> 21)):
+                return  # 自分自身（Tkメニュー等のポップアップ）には勝たせない
+            if owner is not None and owner != win.id:
+                _hidden_thief = owner  # 帯の入力を握っている幽霊窓の ID
+            if restack_above_stage(win, thief=_hidden_thief):
+                self._reassert_at = now
+        except Exception:
+            pass
+        finally:
+            try:
+                if d is not None:
+                    d.close()
+            except Exception:
+                pass
+
+    def _drag(self, e):
+        if self.dock:
+            return  # パネルモードは位置固定
+        x, y = self._clamp_float(e.x_root - self._ox, e.y_root - self._oy)
+        self.root.geometry(f"+{x}+{y}")
+        self.cfg["geometry"] = [x, y]
+        save_config(self.cfg)
+        self.maybe_reassert_stack()
+
+    def toggle_mode(self):
+        self.set_mode("gadget" if self.dock else "dock")
+
+    def set_topmost(self, val):
+        self.cfg["topmost"] = bool(val)
+        save_config(self.cfg)
+        self._apply_layer_mode()
+        if not self.dock and self._or_mode:
+            self.root.attributes("-topmost", bool(val))
+            raise_or_below(bool(val))
+
+    def set_mode(self, mode):
+        if mode == self.cfg["mode"]:
+            return
+        self.cfg["mode"] = mode
+        save_config(self.cfg)
+        self._apply_layer_mode()
+        self.relayout()
+        self.draw()
+
+    def set_orient(self, val):
+        if val == self.cfg.get("orient"):
+            return
+        self.cfg["orient"] = val
+        save_config(self.cfg)
+        self.relayout()
+        self.draw()
+
+    def toggle_item(self, key):
+        items = self.cfg["items"]
+        if items.get(key) and sum(1 for v in items.values() if v) <= 1:
+            return  # 最後の1項目は消させない
+        items[key] = not items.get(key)
+        save_config(self.cfg)
+        self.relayout()
+        self.draw()
+
+    def move_item(self, key):
+        """表示順を1つ右へ動かす（末尾なら先頭へ折返し）。非表示項目の位置は動かさない。"""
+        order = self.cfg["order"]
+        shown = [k for k in order
+                 if self.cfg["items"].get(k) and not self.all_mets[k].unavailable()]
+        if len(shown) <= 1 or key not in shown:
+            return
+        i = shown.index(key)
+        shown.pop(i)
+        shown.insert(0 if i == len(shown) else i + 1, key)  # 1つ右（末尾は先頭へ）
+        it = iter(shown)
+        self.cfg["order"] = [next(it) if k in shown else k for k in order]
+        save_config(self.cfg)
+        self.relayout()
+        self.draw()
+
+    # ---- メニュー ----------------------------------------------------------
+    def _open_menu(self, e):
+        if self._menu is not None:
+            try:
+                self._menu.destroy()
+            except tk.TclError:
+                pass
+        m = Menu(self.root, tearoff=0, bg="#1c2027", fg=FG, activebackground="#2e3440",
+                 activeforeground=FG, bd=1, relief="solid", font=("DejaVu Sans", 9))
+        g = Menu(m, tearoff=0)
+        m.add_cascade(label="View", menu=g)
+        # 現在の表示形式の選択肢は出さず、切り替え先のみを出す
+        if self.dock:
+            g.add_command(label="Gadget", command=lambda: self.set_mode("gadget"))
+        else:
+            g.add_command(label="Dock", command=lambda: self.set_mode("dock"))
+        if not self.dock:  # 最前面・縦横はガジェット時のみ
+            g.add_separator()
+            tk_top = tk.BooleanVar(value=bool(self.cfg.get("topmost", True)))
+            g.add_checkbutton(label="Always on top", variable=tk_top,
+                              command=lambda: self.set_topmost(tk_top.get()))
+            # 現在の配置の選択肢は出さず、切り替え先のみを出す
+            g.add_command(label="Vertical" if self.cfg.get("orient", "h") == "h" else "Horizontal",
+                          command=lambda: self.set_orient(
+                              "v" if self.cfg.get("orient", "h") == "h" else "h"))
+        it = Menu(m, tearoff=0)
+        m.add_cascade(label="Items", menu=it)
+        names = {"cpu": "CPU", "gpu": "GPU", "ram": "RAM",
+                 "vram": "VRAM", "power": "GPU Power", "temp": "GPU Temp",
+                 "cputemp": "CPU Temp", "cpupower": "CPU Power",
+                 "fan": "GPU Fan", "cfrg": "CPU Freq", "net": "Network",
+                 "disk": "Disk I/O", "ssdtemp": "SSD Temp"}
+        n_shown = sum(1 for k in names if self.cfg["items"].get(k)
+                      and not self.all_mets[k].unavailable())
+        for key in self.cfg.get("order", names):
+            name = names[key]
+            if self.all_mets[key].unavailable():
+                it.add_command(label=f"{name} (n/a)", state="disabled")
+                continue
+            shown = bool(self.cfg["items"].get(key))
+            label = f"Hide {name}" if shown else f"Show {name}"
+            state = "disabled" if (shown and n_shown <= 1) else "normal"
+            it.add_command(label=label, state=state,
+                           command=lambda k=key: self.toggle_item(k))
+        # 表示順の変更は右クリックメニューには出さない（config.json の "order" で編集）
+        m.add_separator()
+        m.add_command(label="Quit", command=self.root.destroy)
+        self._menu = m
+        m.tk_popup(e.x_root, e.y_root)
+
+    # ---- 描画 --------------------------------------------------------------
+    def draw(self):
+        cv = self.cv
+        cv.delete("all")
+        for i, met in enumerate(self.visible_mets()):
+            if self.vertical:
+                x0, y0 = 0, i * CELL_H
+            else:
+                x0, y0 = PAD + i * CELL_W, getattr(self, "top_off", 0)
+            self._draw_cell(cv, met, x0, y0)
+
+    def _draw_cell(self, cv, m, x0, y0):
+        ch = CELL_H if self.vertical else self.h - getattr(self, "top_off", 0)
+        gx0, gx1 = x0 + 4, x0 + CELL_W - 4
+        label_y = y0 + 8
+        top, bot = y0 + 16, y0 + ch - 2
+        c = m.ui_color()
+        lv = m.level()
+        # 項目ごとの背景（固有色を薄く混ぜる）でセルの境界を分かりやすくする
+        cv.create_rectangle(x0, y0, x0 + CELL_W, y0 + ch,
+                            fill=blend(BG, m.color, 0.12), outline=blend(BG, m.color, 0.28))
+        cv.create_rectangle(gx0, top, gx1, bot,
+                            fill=blend(BG, m.color, 0.20), outline="")
+        # 波形線〜帯下端の縦グラデ塗り（線付近が濃く bot で BG へ溶ける）。
+        # 水平帯に分割した polygon 近似。グリッド線・波形線より先に置く。
+        pts = m.polyline(gx0, gx1, top, bot)
+        nbands = 8
+        for k, poly in enumerate(fill_bands(pts, top, bot, nbands)):
+            t = 0.85 * (nbands - k) / nbands  # 上端の帯が最も濃く、下へ行くほど BG へ
+            cv.create_polygon(*poly, fill=blend(BG, c, t), outline="")
+        if lv:  # 警告/危険はセル枠を描いて目立たせる
+            cv.create_rectangle(x0 + 1, y0 + 1, x0 + CELL_W - 1, y0 + ch - 1,
+                                outline=c, width=2 if lv == 2 else 1)
+        cv.create_line(gx0, bot, gx1, bot, fill=blend(BG, m.color, 0.45))
+        cv.create_text(gx0, label_y, anchor="w", text=m.label,
+                       fill=c if lv else FG,
+                       font=("DejaVu Sans Mono", 7, "bold" if lv else "normal"))
+        cv.create_text(gx1, label_y, anchor="e", text=m.value_text(), fill=c,
+                       font=("DejaVu Sans Mono", 8 if lv < 2 else 9, "bold"))
+        cv.create_line(*pts, fill=c, width=2 if lv else 1)
+
+
+def main():
+    if "--selftest" in sys.argv:
+        mets = build_metrics()
+        for _ in range(3):
+            sample_cpu(mets)
+            sample_gpu(mets)
+            print("  ".join(f"{m.label}={m.value_text()}" for m in mets.values()))
+            if not GPUS:
+                break
+            import time
+            time.sleep(1)
+        return
+
+    cfg = load_config()
+    if "--mode" in sys.argv:
+        cfg["mode"] = sys.argv[sys.argv.index("--mode") + 1]
+    if "--offset" in sys.argv:
+        cfg["dock_offset_x"] = int(sys.argv[sys.argv.index("--offset") + 1])
+    save_config(cfg)
+
+    mets = build_metrics()
+    root = tk.Tk(className="PulseBar")
+    root.title("PulseBar")
+    bar = Bar(root, mets, cfg)
+    psutil.cpu_percent(interval=None)  # 初回呼び出しの基準値リセット
+
+    # kill -USR1 で gadget/dock 切替（Tk のイベントループ内で処理する）
+    want_toggle = []
+    signal.signal(signal.SIGUSR1, lambda s, f: want_toggle.append(True))
+
+    root.after(400, bar.after_show)
+
+    def tick():
+        if want_toggle:
+            want_toggle.clear()
+            bar.toggle_mode()
+        sample_cpu(mets)
+        sample_gpu(mets)
+        bar.draw()
+        # dock_auto: 帯アプレットの縁を5秒ごとに取り直し（gdbus は重いので間引く）
+        bar._auto_tick += 1
+        if bar._auto_tick >= 5:
+            bar._auto_tick = 0
+            bar.refresh_dock_auto()
+        # 帯に重なっている間は毎tick stage窓直上へ自分を作り直す（常時選択可能に）
+        bar.maybe_reassert_stack()
+        root.after(INTERVAL_MS, tick)
+
+    bar.draw()
+    root.after(200, tick)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
