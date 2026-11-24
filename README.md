@@ -1,7 +1,6 @@
 # PulseBar
 
-Compact desktop gadget for GPU/CPU/RAM/VRAM usage, power and temperature.
-(Keywords: system monitor, desktop widget, HUD overlay, taskbar stats, CPU/GPU/VRAM/temperature bar — alternatives to Conky / Rainmeter-style monitors on Linux Mint Cinnamon)
+A slim system monitor bar for Linux desktops: CPU, GPU, RAM, VRAM, power and temperatures in one row of cells, each with a live waveform. Drops into the Linux Mint Cinnamon panel, or floats as a desktop widget — a lightweight alternative to Conky, Rainmeter-style taskbar stats, and iStat Menus.
 
 ![Gadget view](docs/screenshot_gadget.png)
 
