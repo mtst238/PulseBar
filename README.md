@@ -5,7 +5,7 @@ A slim system monitor bar for Linux desktops: CPU, GPU, RAM, VRAM, power and tem
 ![Gadget view](docs/screenshot_gadget.png)
 
 ## Requirements (tested)
-- OS: Linux Mint 22.3 (Zena), Cinnamon 6.6.9 (X11). Linux (X11) only; no Windows / Wayland
+- OS: Linux Mint 22.3 (Zena), Cinnamon 6.6.9 (X11). Wayland not supported. Also runs on Windows via WSL2 + WSLg (see WSL2_README.md)
 - Python: 3.12.3 (Tk 8.6 from `python3-tk`), venv created by `uv`
 - Python packages: psutil 7.2.2, nvidia-ml-py 13.615.71 (`pynvml`), python-xlib 0.33
 - NVIDIA driver with NVML + dedicated GPU (no NVML -> GPU metrics auto-disabled)
@@ -33,7 +33,7 @@ but is unreadable (first run, asks authorization). Manual: `sudo ./enable_cpu_po
 
 ## Operation
 
-- Right-click: menu (View: Dock/Gadget, Always on top, orientation; Items: Hide/Show; Quit)
+- Right-click: menu (View: Dock/Gadget, Always on top, orientation; Show/Hide: toggle items; Quit)
 - Left-drag waveform: move gadget (gadget mode; saved in `geometry`)
 - Esc: quit. Externally: `kill -USR1 <pid>` toggles dock/gadget
 
