@@ -2,17 +2,29 @@
 # PulseBar launcher (uses ./.venv created by uv)
 cd "$(dirname "$0")"
 
-# Create ./.venv with uv if missing (system python3.12 + 3 deps)
+# Find a usable system python (WSL images often lack 3.12; prefer newest).
+find_python() {
+  for p in python3.12 python3.11 python3; do
+    if command -v "$p" >/dev/null 2>&1; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+# Create ./.venv with uv if missing (found system python + 3 deps)
 if [ ! -x .venv/bin/python ]; then
-  uv venv .venv --python /usr/bin/python3.12 || { echo "uv venv failed"; exit 1; }
+  PY="$(find_python)" || { echo "no python3 found"; exit 1; }
+  uv venv .venv --python "$PY" || { echo "uv venv failed"; exit 1; }
   uv pip install --python .venv/bin/python psutil nvidia-ml-py python-xlib \
     || { echo "dependency install failed"; exit 1; }
 fi
 
-# Run first-time CPU power (RAPL) setup only when needed:
-# powercap exists but energy_uj is unreadable (pkexec = auth dialog, else sudo).
-# No-op when already readable. The bar starts even if this fails.
-if [ -d /sys/class/powercap ]; then
+# WSL: CPU power (RAPL/powercap) is not exposed to the guest; skip setup.
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  echo "WSL detected; skipping RAPL/powercap setup (CPWR not available)"
+elif [ -d /sys/class/powercap ]; then
+  # Run first-time CPU power (RAPL) setup only when needed:
+  # powercap exists but energy_uj is unreadable (pkexec = auth dialog, else sudo).
+  # No-op when already readable. The bar starts even if this fails.
   need=0
   for f in /sys/class/powercap/*/energy_uj; do
     [ -e "$f" ] || continue

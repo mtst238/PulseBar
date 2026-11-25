@@ -53,11 +53,18 @@
                D-BusEval で測る帯右側アプレット群の直前（余白6px）にバー幅で
                右寄せ自動配置（起動時と5秒ごとに再計算、失敗時は最後の位置維持）。
   - 操作: 右クリックでメニュー（項目名は英語）。
+      左ドラッグ: ドック時は常に、ガジェット時は上段（ラベル/数値行）プレス時に、
+      押下点真下の最前面の他ウィンドウ（WM管理フレーム。自分/override-redirect/
+      パネル・デスクトップ系は除外）を探して窓と一緒にドラッグで動かす。対象が
+      無ければ従来動作。ガジェットの波形帯領域プレス時はバー自身を動かす（従来どおり）。
+      中クリック: バー下の窓を前面へ巡回（重なった窓の選択）。押下点と交差する
+      WM管理窓を積層順に列挙し最背面を前面へ raise（_NET_ACTIVE_WINDOW→フレーム
+      Above の順）。連続クリックで候補が巡回し、直後にその窓が左ドラッグ対象になる。
       View: いま出ていない方へ切替のみ（ガジェット中は "Dock"、
             パネル中は "Gadget"。現在の表示形式の選択肢は出さない）。
             以下はガジェット時のみ: "Always on top" と、配置の切り替え先のみ
             （横配置中は "Vertical"、縦配置中は "Horizontal"）。
-      Items: 表示中なら "Hide <name>"、非表示なら "Show <name>"
+      Show/Hide: 表示中なら "Hide <name>"、非表示なら "Show <name>"
              （最後の1項目は非表示にできない）。
       "Quit"。外部からも `kill -USR1 <pid>` で gadget/dock 切替。Esc で終了。
   - config.json キー: mode(gadget|dock), items(項目キー->true/false),
@@ -74,6 +81,32 @@
     （使用率=max, VRAM=合計使用/合計搭載, 電力=合計, 温度=max）。
     検証用フック: PULSEBAR_NO_GPU=1 / PULSEBAR_NO_SENSORS=1 で GPU無し・
     センサー無し構成を再現できる。
+  - WSL2 (WSLg) 対応: /proc/version に microsoft または環境変数
+    WSL_DISTRO_NAME があれば WSL 判定（環境変数 PB_PLATFORM=wsl|native で
+    手動上書き可。結果は IS_WSL）。IS_WSL 時は mode 設定によらず常に
+    ガジェット扱い（ドック計算・gdbus/cinnamon_panel_bounds は呼ばない。
+    config.json の mode は書き換えない）。overrideredirect(True) +
+    attributes('-topmost',True) の無管理窓を geometry でマップ前に配置し、
+    以後の Xlib 積層操作（maybe_reassert_stack / raise_or_below /
+    restack_above_stage / set_window_role / apply_motif_nodecor /
+    request_skip_taskbar / clear_dock_role / 裏窓ドラッグの窓ピッキング）は
+    入口で no-op。Cinnamon 専用の幽霊窓戦法は WSLg では誤作動するため。
+    ドラッグ（B1-Motion）と Esc 終了は従来通り。センサーは WSL 側から
+    見えるものだけ（GPU=WSLg の NVML。CPU温度/SSD温度/powercap は通常
+    見えず、no_sensor 扱いで自動選択不可になる）。概要は WSL2_README.md、
+    WSL 上の接続検証は wsl_selftest.py。
+  - メニュー方式（環境変数 PB_MENU=auto|popup|inline、既定 auto）:
+      popup = tk_popup で別ポップアップ窓（native 従来方式）。
+      inline = バー窓自身を縦/横に拡張し同一 canvas 上に面板を描く
+        （別窓を作らない。他アプリの grab 妨害に強く WSLg 推奨。バー中心が
+        画面下半分/右半分なら上/左、逆なら下/右へ拡張。項目構成は popup 版と
+        同一: View 切替・Always on top・縦横・Items Show/Hide・Quit）。
+        展開中は別 Xlib 接続で root に pointer+keyboard grab を張り
+        （grab 失敗時は focus_force + Tk バインディングにフォールバック）、
+        面板外クリック/再右クリック/Esc で閉じる。Esc は展開中=閉じる、
+        閉じている=終了。auto は native=popup / WSL=inline。native でも
+        PB_MENU=inline で同経路を試せる。WSL でも PB_MENU=popup で従来
+        ポップアップが使える。
 """
 import json
 import os
@@ -85,6 +118,7 @@ import time
 from collections import deque
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import Menu
 
 import psutil
@@ -210,6 +244,7 @@ def find_ssd_temp_source():
 SSD_TEMP = find_ssd_temp_source()
 
 INTERVAL_MS = 1000        # 更新間隔
+_PB_DEBUG = bool(os.environ.get("PB_DEBUG"))   # 積層再主張のデバッグ出力
 HISTORY = 60              # 波形点数（=約60秒分）
 POWER_FLOOR = 100.0       # 電力スケールの下限 (W)
 CFRG_FLOOR = 1000.0       # CPU周波数スケールの下限 (MHz)
@@ -221,6 +256,7 @@ DISK_LAST = [0.0, 0]      # [前値秒, 前値(read+write bytes)] (disk_io_count
 
 PAD = 6
 CELL_W = 60               # 1セルの幅
+_DRAG_DEBUG = bool(os.environ.get("PULSEBAR_DRAG_DEBUG"))
 CELL_H = 40               # 1セルの高さ（gadget 用）
 
 BG = "#15171c"
@@ -231,6 +267,43 @@ WARN = "#ffb86c"   # warn 超
 CRIT = "#ff4444"   # crit 超
 
 PANEL_H = 0               # 起動時に測った下端パネルの高さ
+
+
+def detect_wsl():
+    """/proc/version に microsoft または WSL_DISTRO_NAME 環境変数 -> WSL。
+    環境変数 PB_PLATFORM=wsl|native で手動上書き（native 機で WSL 経路を
+    検証するためのフックも含む）。"""
+    ov = os.environ.get("PB_PLATFORM", "").strip().lower()
+    if ov in ("wsl", "native"):
+        return ov == "wsl"
+    try:
+        with open("/proc/version") as f:
+            if "microsoft" in f.read().lower():
+                return True
+    except OSError:
+        pass
+    return bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
+IS_WSL = detect_wsl()
+
+
+def resolve_menu_mode():
+    """PB_MENU=auto|popup|inline。auto: WSL=inline / native=popup（従来）。"""
+    v = os.environ.get("PB_MENU", "auto").strip().lower()
+    if v not in ("auto", "popup", "inline"):
+        v = "auto"
+    return ("inline" if IS_WSL else "popup") if v == "auto" else v
+
+
+MENU_MODE = resolve_menu_mode()   # Bar 生成時に参照（環境変数は起動時固定）
+
+# インラインメニュー（同一窓面板）の寸定数
+MENU_ROW_H = 18           # 項目1行の高さ
+MENU_HDR_H = 16           # グループ見出し1行の高さ
+MENU_SEP_H = 7            # 区切り線の高さ
+MENU_PAD = 5              # 面板の内側余白
+MENU_W_MIN = 176          # 面板の最小幅
 
 
 def load_config():
@@ -673,6 +746,8 @@ def set_window_role(dock, w, h, x, y, above=True):
     above=True なら最上位に積む。above=False は他ウィンドウのウラ面へ下げるが、
     壁紙ウィンドウの下に潜ると見えなくなるため、壁紙の直上（＝アプリ全員のウラ）に
     restack する。壁紙が見つからなければ単体で最背面。"""
+    if IS_WSL:
+        return False  # WSLg: DOCK タイプ/積層操作不要（幽霊窓戦法の誤作動防止）
     try:
         from Xlib import X as Xc
         d, win = find_my_window()
@@ -708,6 +783,8 @@ def set_window_role(dock, w, h, x, y, above=True):
 
 def clear_dock_role():
     """_NET_WM_WINDOW_TYPE / STRUT を削除する（ドック→ガジェット戻し用）。"""
+    if IS_WSL:
+        return False
     try:
         d, win = find_my_window()
         if win is None:
@@ -769,16 +846,23 @@ def force_above(win, other):
     """ Below→Above の二段 restack で、積層順に「変化」を作ってから other の直上に
     積む。muffin は同じ位置への no-op configure だと入力ルーティングを再同期せず、
     真に上下が入れ替わる操作のときだけ追従する（実測: query_pointer の owner が
-    0x1d8 のまま積む操作は空振り、Below→Above で反転し以降tickで保持）。"""
+    0x1d8 のまま積む操作は空振り、Below→Above で反転し以降tickで保持）。
+    罠（右クリック不能事件 2026-11-25）: win.display は python-xlib の
+    _BaseDisplay を返し sync() が無い（AttributeError）。握りつぶすと常に False
+    になり再主張が全滅する。同じ接続内は要求順に処理されるので flush() で十分。"""
     try:
+        if other is not None and getattr(other, "id", None) == win.id:
+            return False  # sibling が自分自身だと BadMatch
         d = win.display
         Xc = __import__("Xlib").X
         win.configure(stack_mode=Xc.Below, sibling=other)
-        d.sync()
+        d.flush()
         win.configure(stack_mode=Xc.Above, sibling=other)
-        d.sync()
+        d.flush()
         return True
-    except Exception:
+    except Exception as e:
+        if _PB_DEBUG:
+            import traceback; traceback.print_exc()
         return False
 
 
@@ -891,14 +975,122 @@ def outermost_ancestor(d, root, win):
     return top
 
 
-def restack_above_stage(win, thief=None):
+def raise_managed(d, managed_win, frame=None):
+    """WM 管理窓を前面へ: まず _NET_ACTIVE_WINDOW（mutter/muffin はこれで
+    フォーカス+raise する）。そのうえでフォールバックとして root 直下の
+    フレーム窓に stack_mode=Above の configure を送る（フレーム無しの窓は自分）。"""
+    from Xlib import X as Xc
+    from Xlib.protocol import event
+    try:
+        nwa = d.intern_atom("_NET_ACTIVE_WINDOW")
+        # EWMH 準拠: window フィールド=対象、送信先=root
+        ev = event.ClientMessage(window=managed_win, client_type=nwa,
+                                 data=(32, [2, 0, 0, 0, 0]))  # source=pager
+        d.screen().root.send_event(ev, propagate=False,
+                                   event_mask=Xc.SubstructureNotifyMask |
+                                   Xc.SubstructureRedirectMask)
+        d.flush()
+    except Exception:
+        pass
+    try:
+        if frame is None:
+            frame = outermost_ancestor(d, d.screen().root, managed_win)
+        frame.configure(stack_mode=Xc.Above)
+        d.flush()
+    except Exception:
+        pass
+
+
+def _windows_at_point(d, root, x, y, bar_base):
+    """(x,y) を覆う WM 管理窓を積層順（前面->背面）に (frame, managed) で列挙。
+    除外（自分/O-R/パネル・デスクトップ/管理外）は除去、重複は最初の位置だけ残す。"""
+    out = []
+    seen = set()
+    for w in _deepest_at_point(d, root, x, y, bar_base):
+        pair = climb_window(d, root, w)
+        if pair is None:
+            continue
+        frame, managed = pair
+        if frame.id not in seen:
+            seen.add(frame.id)
+            out.append((frame, managed))
+    return out
+
+
+def _net_moveresize(d, win, x, y):
+    """_NET_MOVERESIZE_WINDOW を wmctrl と同じ形式で root に送る
+    （window フィールド=対象、l[0]=flags(x,y present)+NW gravity、l[1..2]=x,y）。
+    muffin は管理窓への素の X configure（クライアント/フレームどちらでも）を
+    無視するため、WM への移動要求はこれで行う（wmctrl -e と同じ経路）。"""
+    from Xlib import X as Xc
+    from Xlib.protocol import event
+    flags = 0x100 | 0x200 | 1  # x present | y present | gravity=NorthWest
+    ev = event.ClientMessage(window=win,
+                             client_type=d.intern_atom("_NET_MOVERESIZE_WINDOW"),
+                             data=(32, [flags, x & 0xffffffff, y & 0xffffffff, 0, 0]))
+    root = d.screen().root
+    root.send_event(ev, propagate=False,
+                    event_mask=Xc.SubstructureNotifyMask | Xc.SubstructureRedirectMask)
+    d.flush()
+
+
+def _deepest_at_point(d, root, x, y, bar_base):
+    """(x,y) を覆う窓を積層 DFS で前面->背面順に返す（管理窓への写像は呼び出し側）。
+    除外判断（O-R/パネル類）は climb_window 側で行うのでここでは全候補を返す。"""
+    Xv = 2  # IsViewable
+
+    def hits(win, lx, ly):
+        try:
+            kids = win.query_tree().children  # 積層の背面->前面順
+        except Exception:
+            return []
+        out = []
+        for c in reversed(kids):  # 前面順
+            if (c.id >> 21) == bar_base:
+                continue  # 自分自身（バー・Tk メニュー等の自前ポップアップ）
+            try:
+                g = c.get_geometry()
+                if not (g.x <= lx < g.x + g.width and
+                        g.y <= ly < g.y + g.height):
+                    continue
+                if c.get_attributes().map_state != Xv:
+                    continue
+            except Exception:
+                continue
+            subs = hits(c, lx - g.x, ly - g.y)
+            if subs:
+                out.extend(subs)  # 前面窓の内部が最前面
+            else:
+                out.append(c)
+        return out
+
+    return hits(root, x, y)
+
+
+def _walk_to_point(d, root, x, y, bar_base):
+    """(x,y) 押下点の最前面 WM 管理窓（移動対象）を返す。無ければ None。
+    オーバレイ（幽霊/stage/O-R）は climb_window の除外で素通りされるので、
+    オーバレイの下の本当の窓が見つかる。"""
+    frames = _windows_at_point(d, root, x, y, bar_base)
+    return frames[0] if frames else None
+
+
+def restack_above_stage(win, thief=None, d=None):
     """帯上のポインタ入力を握るコンポジタ・オーバレイ窓の直上に自分を積む。
     query_pointer で実測した入力オーナー（ツリーに出ないことがある最強候補）を
     優先し、ダメならツリーに現れる全画面オーバレイ窓の直上へ積む。
     （実測: override-redirect のスタック操作は muffin に無視されないこと、
-    真の thief 0x1d8 は sibling に挙げるまでツリーへ出ないこと。）"""
+    真の thief 0x1d8 は sibling に挙げるまでツリーへ出ないこと。）
+    d は本物の Xlib.display.Display を渡すこと（find_my_window の返し値）。
+    win.display は接続オブジェクト(_BaseDisplay)で create_resource_object /
+    screen を持たない（罠 2026-11-25: 幽霊窓の sibling が作れず再主張が全滅し
+    右クリック不能になった）。省略時は find_my_window で取り直す。"""
+    if IS_WSL:
+        return False  # WSLg: Cinnamon 専用の幽霊窓 restack は行わない
     try:
-        d = win.display
+        if d is None:
+            d2, win2 = find_my_window()
+            d = d2
         Xc = __import__("Xlib").X
         cands = []
         if thief is not None:
@@ -910,12 +1102,18 @@ def restack_above_stage(win, thief=None):
         for is_thief, st in cands:
             if force_above(win, st):
                 return True
+            if _PB_DEBUG:
+                print("  [restack] cand=%s FAILED" % (hex(getattr(st, 'id', 0)),), flush=True)
             global _hidden_thief
             if is_thief:
                 _hidden_thief = None  # 死んだIDなら捨ててツリー候補で再試行
+        if _PB_DEBUG:
+            print("  [restack] cands=%s -> False" % (
+                [hex(getattr(s, 'id', 0)) for _, s in cands],), flush=True)
         return False
     except Exception:
-        pass
+        if _PB_DEBUG:
+            import traceback; traceback.print_exc()
     return False
 
 
@@ -923,6 +1121,8 @@ def raise_or_below(above):
     """自分の積層を再主張する。WM管理時は WM のフレーム側を restack する。
     最前面指定時は、コンポジタの全画面オーバレイ窓（帯のクリックを握る）の
     直上にも積む（帯に重なる位置で右クリックが届くように）。"""
+    if IS_WSL:
+        return  # WSLg: tick 毎の Xlib 積層操作は全停止
     try:
         from Xlib import X as Xc
         d, win = find_my_window()
@@ -939,7 +1139,7 @@ def raise_or_below(above):
             pass
         target.configure(stack_mode=Xc.Above if above else Xc.Below)
         if above:
-            restack_above_stage(target)
+            restack_above_stage(target, d=d)
         d.flush()
     except Exception:
         pass
@@ -947,6 +1147,8 @@ def raise_or_below(above):
 
 def apply_motif_nodecor():
     """_MOTIF_WM_HINTS でタイトルバー等の飾りを消す（マップ前に効かせる）。"""
+    if IS_WSL:
+        return False
     try:
         d, win = find_my_window()
         if win is None:
@@ -962,6 +1164,8 @@ def apply_motif_nodecor():
 def request_skip_taskbar():
     """WM へ _NET_WM_STATE の SKIP_TASKBAR / SKIP_PAGER を要求する（マップ後に送る）。
     積層はアクティブ順（通常の管理ウィンドウと同じ）に任せるため BELOW は要求しない。"""
+    if IS_WSL:
+        return False
     try:
         from Xlib import X as Xc
         from Xlib.protocol import event
@@ -979,6 +1183,115 @@ def request_skip_taskbar():
         return False
 
 
+def menu_grab_loop(d, actions, alive):
+    """インラインメニュー展開中に grab 接続で待機するイベントループ（grab 自体は
+    Tk スレッド側の try_menu_grab() が同期で張る）。grab を張るのは Tk とは
+    「別クライアント」の接続なので、grab 中はバー内外すべての press/motion が
+    この接続にだけ届く。press（ボタン番号付き）と motion は root 座標ごと
+    actions に積んで Tk へ転送し、面板ヒットテストは Tk 側（_poll_menu_grab）で
+    行う（Tk の同名バインディングは grab 中は発火しない＝二重処理なし）。
+    - keyboard grab は owner_events=False: OR 窓は click-to-focus で
+      フォーカスを持たないので、これが Esc の唯一確実な経路。
+    - press は押しっぱなし/drag を食わないよう release まで motion を抑止。
+    - alive() が偽（メニューが Tk 側で閉じた）になり次第 finally で grab 解除+
+      接続クローズ。50ms select で確認するので grab 寿命≈メニュー寿命。
+    - python-xlib 罠: fd は d.fd ではなく d.display.fileno()。"""
+    from Xlib import X
+    import select
+    done = False
+    suppressing = False  # press→release まで motion 無視（ドラッグ誤反応防止）
+    try:
+        while not done and alive():
+            try:
+                select.select([d.display.fileno()], [], [], 0.05)
+            except (InterruptedError, OSError):
+                continue
+            while d.pending_events():
+                try:
+                    ev = d.next_event()
+                except Exception:
+                    done = True
+                    break
+                et = getattr(ev, "type", None)
+                if et == X.KeyPress:
+                    # keysym 直比較でなく keycode から d.keycode_to_keysym で照合
+                    for ks in d.keycode_to_keysym(ev.detail, 0):
+                        if ks == 0xFF1B:  # XK_Escape
+                            actions.append(("esc",))
+                            done = True
+                            break
+                        if ks in (0xFF0D, 0xFF8D):  # Return / KP_Enter
+                            actions.append(("enter",))
+                            done = True
+                            break
+                elif et == X.ButtonPress:
+                    if suppressing:
+                        continue
+                    # detail=ボタン番号（3=再右クリック: Tk 側で閉じるに翻訳）。
+                    # grab 解除は alive() が偽（=メニューが閉じた）になったときだけ。
+                    actions.append(("press", ev.root_x, ev.root_y, ev.detail))
+                    suppressing = True
+                elif et == X.ButtonRelease:
+                    suppressing = False
+                elif et == X.MotionNotify and not suppressing:
+                    # 高頻度: 古い motion は新しいもので上書き（1個だけ保持）
+                    while actions and actions[-1][0] == "motion":
+                        actions.pop()
+                    actions.append(("motion", ev.root_x, ev.root_y))
+    finally:
+        try:
+            d.screen().root.ungrab_pointer(X.CurrentTime)
+            d.screen().root.ungrab_keyboard(X.CurrentTime)
+            d.flush()
+        except Exception:
+            pass
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def try_menu_grab(d, tk_win_id):
+    """Tk スレッドから同期で grab を張る（結果を即座に知って Tk バインディングの
+    フォールバック要否を決めるため）。失敗（他アプリが grab 中: GrabBusy/
+    GrabImpossible）は False を返し、呼び出し側は focus_force/Esc/FocusOut/
+    再右クリックに頼る。
+    python-xlib 罠: grab_pointer の引数順は (owner_events, event_mask,
+    pointer_mode, keyboard_mode, confine_to, cursor, time)（event_mask は2番目）。
+    grab_* の戻り値は GrabNotify ではなく status が既に int（r.status と読むな）。"""
+    from Xlib import X
+    try:
+        r_kb = d.screen().root.grab_keyboard(False, X.GrabModeAsync,
+                                             X.GrabModeAsync, X.CurrentTime)
+        r_pt = d.screen().root.grab_pointer(
+            False,
+            (X.ButtonPressMask | X.ButtonReleaseMask | X.PointerMotionMask),
+            X.GrabModeAsync, X.GrabModeAsync, 0, 0, X.CurrentTime)
+        d.sync()
+        ok = (r_kb == X.GrabSuccess and r_pt == X.GrabSuccess)
+        if not ok:
+            try:
+                d.screen().root.ungrab_pointer(X.CurrentTime)
+                d.screen().root.ungrab_keyboard(X.CurrentTime)
+                d.flush()
+            except Exception:
+                pass
+        if _PB_DEBUG:
+            print("[grab] kb=%s pt=%s ok=%s" % (r_kb, r_pt, ok),
+                  flush=True)
+        return ok
+    except Exception:
+        if _PB_DEBUG:
+            import traceback; traceback.print_exc()
+        try:
+            d.screen().root.ungrab_pointer(X.CurrentTime)
+            d.screen().root.ungrab_keyboard(X.CurrentTime)
+            d.flush()
+        except Exception:
+            pass
+        return False
+
+
 class Bar:
     REASSERT_GRACE_S = 1.5  # 最後の再主張後、この時間だけ restack を継続（ホバー離れの余韻）
 
@@ -990,15 +1303,27 @@ class Bar:
         PANEL_H = measure_panel_height(root)
         self.geom = monitor_geom(True) or monitor_geom(False) \
             or (0, root.winfo_screenwidth(), root.winfo_screenheight())
+        # インラインメニュー（PB_MENU=inline）用状態。popup mode では _menu は
+        # tk Menu か None のまま（面板辞書になるのは inline 経路のみ）。
+        self._inline_menu = MENU_MODE == "inline"
+        self._menu = None
+        self._grab_active = False
+        self._grab_q = []
+        self._body = None       # 意図したバー本体矩形 (x,y,w,h)。窓矩形ではない。
+        self._win_w = self._win_h = 0
+        self._mfont = tkfont.Font(family="DejaVu Sans", size=9)
         root.overrideredirect(True)
-        root.attributes("-topmost", bool(cfg.get("topmost", True)))
+        # WSLg: WM の積層操作が使えないので常に無管理最前面窓。
+        root.attributes("-topmost",
+                        True if IS_WSL else bool(cfg.get("topmost", True)))
         try:
             root.attributes("-alpha", 0.92)
         except tk.TclError:
             pass
         # topmost off のガジェットだけ WM管理（飾りなし）にする。override-redirect の
         # ママでは WM(muffin) が常に最前面層へ回してウラ面へ行けない（実測）。
-        self._or_mode = self.dock or bool(cfg.get("topmost", True))
+        # WSLg は常に OR 窓。
+        self._or_mode = self.dock or IS_WSL or bool(cfg.get("topmost", True))
         if not self._or_mode:
             root.overrideredirect(False)
             apply_motif_nodecor()  # マップ前に飾りなしヒントを渡す
@@ -1011,18 +1336,30 @@ class Bar:
             self._pbounds = cinnamon_panel_bounds()
         self.relayout(first=True)
         root.configure(bg=BG)
-        self.cv = tk.Canvas(root, width=self.w, height=self.h, bg=BG, highlightthickness=0)
+        self.cv = tk.Canvas(root, width=self._win_w, height=self._win_h, bg=BG,
+                            highlightthickness=0)
         self.cv.pack()
         root.bind("<Button-1>", self._grab)
         root.bind("<B1-Motion>", self._drag)
+        root.bind("<ButtonRelease-1>", self._release)
+        root.bind("<Button-2>", self._cycle)
         root.bind("<Button-3>", self._open_menu)
-        root.bind("<Escape>", lambda e: root.destroy())
-        self._menu = None
+        if self._inline_menu:
+            # インライン面板: B1/Motion/Esc をメニュー判定ラッパー経由にする。
+            root.bind("<Button-1>", self._click1)
+            root.bind("<Motion>", self._motion)
+            root.bind("<Escape>", self._key_esc)
+            # 他窓へフォーカスが実移動した時だけ面板を閉じる（grab 由来 detail は
+            # _focus_out 側で無視。OR 窓は通常フォーカスを持たないので実害なし）。
+            root.bind("<FocusOut>", self._focus_out)
+        else:
+            root.bind("<Escape>", lambda e: root.destroy())
 
     # ---- 状態ヘルパ -------------------------------------------------------
     @property
     def dock(self):
-        return self.cfg["mode"] == "dock"
+        # WSLg: mode 設定によらず常にガジェット扱い（config.json は書き換えない）
+        return self.cfg["mode"] == "dock" and not IS_WSL
 
     def visible_mets(self):
         return [self.all_mets[k] for k in self.cfg.get("order", self.all_mets)
@@ -1054,7 +1391,11 @@ class Bar:
             self.w, self.h = cw * n + PAD, ch
         self.vertical = vertical
         self.top_off = 0
-        old_x, old_y = self.root.winfo_x(), self.root.winfo_y()
+        # インラインメニュー展開中は窓原点≠本体原点なので本体矩形を位置基準にする
+        if isinstance(self._menu, dict):
+            old_x, old_y = self._body[0], self._body[1]
+        else:
+            old_x, old_y = self.root.winfo_x(), self.root.winfo_y()
         if self.dock:
             x, y = self._dock_pos()
         elif first and self.cfg.get("geometry"):
@@ -1065,15 +1406,16 @@ class Bar:
             x, y = self._clamp_float(old_x, old_y)
         else:
             x, y = self._clamp_float(old_x, old_y)
-        self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
-        if hasattr(self, "cv"):
-            self.cv.configure(width=self.w, height=self.h)
+        self._body = (x, y, self.w, self.h)
+        self._apply_window_geom()
         self.root.update_idletasks()
         if not self._or_mode:
             apply_motif_nodecor()
             request_skip_taskbar()
         else:
-            set_window_role(self.dock, self.w, self.h, x, y,
+            # 注意: 形状(bounding shape)は「窓の実寸」で切る（self.w/h は本体矩形。
+            # メニュー展開中の relayout で面板がクリップされる罠）。
+            set_window_role(self.dock, self._win_w, self._win_h, x, y,
                             above=self.dock or bool(self.cfg.get("topmost", True)))
 
     def _clamp_float(self, x, y):
@@ -1126,14 +1468,14 @@ class Bar:
             request_skip_taskbar()
             return
         x, y = self.root.winfo_x(), self.root.winfo_y()
-        set_window_role(self.dock, self.w, self.h, x, y,
+        set_window_role(self.dock, self._win_w, self._win_h, x, y,
                         above=self.dock or bool(self.cfg.get("topmost", True)))
         self.maybe_reassert_stack()
 
     def _apply_layer_mode(self):
         """override-redirect（前面固定/dock）と WM管理（ウラ面可）を切り替える。
         overrideredirect の変更はマップ込みで作り直す必要がある。"""
-        want = self.dock or bool(self.cfg.get("topmost", True))
+        want = self.dock or IS_WSL or bool(self.cfg.get("topmost", True))
         if want == self._or_mode:
             return
         root = self.root
@@ -1154,6 +1496,130 @@ class Bar:
     # ---- 操作 -------------------------------------------------------------
     def _grab(self, e):
         self._ox, self._oy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
+        self._wd = None  # 裏窓ドラッグセッション
+        # ドックは常時裏窓移動。ガジェットは上段（ラベル/数値行、セル先頭16px）
+        # プレス時だけ裏窓移動し、波形帯領域プレス時は従来どおりバー自身を動かす。
+        yy = e.y - getattr(self, "top_off", 0)
+        if self.vertical:
+            yy = yy % CELL_H
+        want_window = self.dock or yy < 16
+        if _DRAG_DEBUG:
+            print(f"[grab] xy={e.x_root},{e.y_root} y={e.y} want_win={want_window}", flush=True)
+        if want_window:
+            self._wd = self._pick_under_window(e)
+            if _DRAG_DEBUG:
+                print(f"[grab] pick -> {self._wd and (hex(self._wd['frame'].id), hex(self._wd['managed'].id))}", flush=True)
+            # Tk の暗黙 grab（Button-1 束縛）がポインタがバーから外れても
+            # B1-Motion を Delivery し続けるので追加 grab はしない
+            # （余計な grab は tk_popup の grab 罠を招く）。
+
+    def _pick_under_window(self, e):
+        """押下点真下の最前面の他窓を特定し、移動対象と Xlib 接続を返す。
+        対象が無ければ None（＝従来動作フォールバック）。"""
+        if IS_WSL:
+            return None  # WSLg: ドラッグは必ずバー自身を動かす（他窓ピッキング停止）
+        try:
+            from Xlib import display as xld
+            d = xld.Display()
+            root = d.screen().root
+            pair = _walk_to_point(d, root, e.x_root, e.y_root,
+                                  self.root.winfo_id() >> 21)
+            if pair is None:
+                d.close()
+                return None
+            frame, managed = pair
+            return {"d": d, "frame": frame, "managed": managed,
+                    "px": e.x_root, "py": e.y_root}
+        except Exception:
+            return None
+
+    def _cycle(self, e):
+        """中クリック: 押下点と交差する WM 管理窓のうち最背面のものを前面へ raise。
+        連続クリックで候補が巡回する（上げる→また最背面を上げる の繰り返しで
+        積層が回転し、重なる窓を1つずつ選べる）。左ドラッグの対象は押下点の
+        最前面窓なので、ここで前に出した窓がそのままドラッグ対象になる。"""
+        try:
+            from Xlib import display as xld
+            d = xld.Display()
+            root = d.screen().root
+            frames = _windows_at_point(d, root, e.x_root, e.y_root,
+                                       self.root.winfo_id() >> 21)
+            if frames:
+                frame, managed = frames[-1]  # 最背面を前面へ（巡回）
+                if _DRAG_DEBUG:
+                    print(f"[cycle] {len(frames)} candidates, raise "
+                          f"0x{frame.id:08x}", flush=True)
+                raise_managed(d, managed, frame)
+            d.close()
+        except Exception:
+            pass
+
+    def _release(self, e):
+        wd = getattr(self, "_wd", None)
+        self._wd = None
+        if wd is not None:
+            try:
+                wd["d"].close()
+            except Exception:
+                pass
+
+    def _drag(self, e):
+        wd = getattr(self, "_wd", None)
+        if wd is not None:
+            try:
+                self._move_under_window(wd, e)
+            except Exception:
+                if _DRAG_DEBUG:
+                    import traceback
+                    traceback.print_exc()
+            return
+        if self.dock:
+            return  # パネルモードは自己移動しない（裏窓移動は上で処理済み）
+        x, y = self._clamp_float(e.x_root - self._ox, e.y_root - self._oy)
+        self.root.geometry(f"+{x}+{y}")
+        self.cfg["geometry"] = [x, y]
+        save_config(self.cfg)
+        self.maybe_reassert_stack()
+
+    def _move_under_window(self, wd, e):
+        """毎モーション: 窓の現在位置（root 絶対）を再取得し、ポインタ移動差分を
+        加算した地点へ _NET_MOVERESIZE_WINDOW で移動要求する（mutter/muffin は
+        管理窓への素の configure を無視するため WM 経由。wmctrl -e と同じ経路）。
+        WM は位置要求に frame extents 相当の固定オフセットを効かせるので、前回
+        要求地点と今回の実位置の誤差を計測し、次要求から補正する（閉ループ。
+        計測は次のモーション時＝WM が反映した後來なので stale に強い）。
+        窓側が座標系を変えても（WM が動かしても）現在位置基準なので破綻しない。"""
+        d = wd["d"]
+        win = wd["managed"]
+        ax, ay = self._win_abs_xy(d, win)
+        pend = wd.get("pend")
+        if pend is not None:
+            wd["err"] = (ax - pend[0], ay - pend[1])
+        ex, ey = wd.get("err", (0, 0))
+        nx = ax + (e.x_root - wd["px"]) - ex
+        ny = ay + (e.y_root - wd["py"]) - ey
+        wd["px"], wd["py"] = e.x_root, e.y_root
+        _net_moveresize(d, win, nx, ny)
+        wd["pend"] = (nx, ny)
+
+    @staticmethod
+    def _win_abs_xy(d, win):
+        """窓の root 絶対座標（親鎖の x,y 総和。境界幅 0 の WM フレーム前提で十分）。"""
+        x = y = 0
+        w = win
+        root = d.screen().root
+        for _ in range(32):
+            try:
+                g = w.get_geometry()
+                x += g.x
+                y += g.y
+                par = w.query_tree().parent
+                if par is None or par.id == root.id:
+                    break
+                w = par
+            except Exception:
+                break
+        return x, y
 
     def maybe_reassert_stack(self):
         """前面固定モード（dock 含む）でバーが下端パネル帯に重なっているとき、帯の
@@ -1172,11 +1638,14 @@ class Bar:
         される（実操作ではマウスを寄せてからクリックするので許容）。
         オーバレイ窓はツリーに出ないことがあるため、ポインタがバー∩帯の上にある
         ときは query_pointer の入力オーナーで真の相手を見つけてキャッシュする。"""
+        if IS_WSL:
+            return  # WSLg: 幽霊窓戦法は誤作動。tick 毎の積層操作は全停止
         if not self._or_mode:
             return
         mh = self.geom[2]
         band_top = mh - (PANEL_H or 40)
         d = None
+        dbg = _PB_DEBUG
         try:
             bx, by = self.root.winfo_x(), self.root.winfo_y()
             if by + self.h <= band_top:
@@ -1205,8 +1674,14 @@ class Bar:
                 return  # 実需なし: ポップアップ（他窓）が上でも restack しない
             last = getattr(self, "_reassert_at", None)
             if last is not None and now - last >= self.REASSERT_GRACE_S:
+                if dbg: print("[reassert] grace-expired", flush=True)
                 return  # 連続要求が猶予(1.5s)を超過: restack を絞る
-            if restack_above_stage(win, thief=_hidden_thief):
+            ok = restack_above_stage(win, thief=_hidden_thief, d=d)
+            if dbg:
+                print("[reassert] bar=(%d,%d,%d,%d) ptr=(%d,%d) owner=%s ok=%s" % (
+                    bx, by, self.w, self.h, px, py,
+                    hex(owner) if owner else None, ok), flush=True)
+            if ok:
                 self._reassert_at = now
         except Exception:
             pass
@@ -1218,10 +1693,13 @@ class Bar:
                 pass
 
     def _drag(self, e):
+        if isinstance(getattr(self, "_menu", None), dict):
+            return  # インラインメニュー展開中はバードラッグ不可（押下は選択処理）
         if self.dock:
             return  # パネルモードは位置固定
         x, y = self._clamp_float(e.x_root - self._ox, e.y_root - self._oy)
         self.root.geometry(f"+{x}+{y}")
+        self._body = (x, y, self.w, self.h)  # 本体矩形を窓と同期（面板展開基準）
         self.cfg["geometry"] = [x, y]
         save_config(self.cfg)
         self.maybe_reassert_stack()
@@ -1230,6 +1708,8 @@ class Bar:
         self.set_mode("gadget" if self.dock else "dock")
 
     def set_topmost(self, val):
+        if IS_WSL:
+            return  # WSLg: 窓は常に OR+topmost 固定。config も書き換えない
         self.cfg["topmost"] = bool(val)
         save_config(self.cfg)
         self._apply_layer_mode()
@@ -1238,6 +1718,10 @@ class Bar:
             raise_or_below(bool(val))
 
     def set_mode(self, mode):
+        if IS_WSL:
+            # WSLg: mode は常時ガジェット解釈。config も書き換えない（ゲート:
+            # WSL 起動/操作で config.json の mode が変わってはならない）。
+            return
         if mode == self.cfg["mode"]:
             return
         self.cfg["mode"] = mode
@@ -1261,7 +1745,10 @@ class Bar:
         items[key] = not items.get(key)
         save_config(self.cfg)
         self.relayout()
-        self.draw()
+        if self._inline_menu and isinstance(self._menu, dict):
+            self._rebuild_menu()  # 面板を開いたままラベル/高さだけ作り直す
+        else:
+            self.draw()
 
     def move_item(self, key):
         """表示順を1つ右へ動かす（末尾なら先頭へ折返し）。非表示項目の位置は動かさない。"""
@@ -1280,7 +1767,22 @@ class Bar:
         self.draw()
 
     # ---- メニュー ----------------------------------------------------------
+    ITEM_NAMES = {"cpu": "CPU", "gpu": "GPU", "ram": "RAM",
+                  "vram": "VRAM", "power": "GPU Power", "temp": "GPU Temp",
+                  "cputemp": "CPU Temp", "cpupower": "CPU Power",
+                  "fan": "GPU Fan", "cfrg": "CPU Freq", "net": "Network",
+                  "disk": "Disk I/O", "ssdtemp": "SSD Temp"}
+
     def _open_menu(self, e):
+        if self._inline_menu:
+            # 同一窓面板経路（pop-up 窓を作らない。WSL 既定。native でも手動可）
+            if getattr(self, "_grab_active", False):
+                return  # grab 中は事件が grab 転送側(_poll_menu_grab)へ届く
+            if isinstance(self._menu, dict):
+                self.close_menu()  # 再右クリック=閉じる
+                return
+            self.open_menu()
+            return
         if self._menu is not None:
             try:
                 self._menu.destroy()
@@ -1305,7 +1807,7 @@ class Bar:
                           command=lambda: self.set_orient(
                               "v" if self.cfg.get("orient", "h") == "h" else "h"))
         it = Menu(m, tearoff=0)
-        m.add_cascade(label="Items", menu=it)
+        m.add_cascade(label="Show/Hide", menu=it)
         names = {"cpu": "CPU", "gpu": "GPU", "ram": "RAM",
                  "vram": "VRAM", "power": "GPU Power", "temp": "GPU Temp",
                  "cputemp": "CPU Temp", "cpupower": "CPU Power",
@@ -1328,20 +1830,451 @@ class Bar:
         m.add_command(label="Quit", command=self.root.destroy)
         self._menu = m
         m.tk_popup(e.x_root, e.y_root)
+        # tk_popup 直後の一元経路だけで呼ぶ（再展開時も毎回ここを通る）。
+        self.root.after(60, self._set_popup_opacity)
+
+    def _set_popup_opacity(self):
+        """tk_popup メニュー窓にコンポジタの窓透過（_NET_WM_WINDOW_OPACITY）を
+        設定する。Tk 側の色は変えず、muffin/mutter に背後を薄く混ぜさせる。
+        PB_MENU_ALPHA=0.0-1.0（既定 0.90）。>=0.995 ならプロパティ削除で完全不透明。
+        窓が見つからない／例外時は何もしない（メニューは不透明のまま可）。
+        インライン面板経路（PB_MENU=inline）はバー窓 alpha 0.92 が効くため未使用。"""
+        try:
+            a = float(os.environ.get("PB_MENU_ALPHA", "0.90"))
+        except ValueError:
+            a = 0.90
+        a = min(max(a, 0.0), 1.0)
+        try:
+            from Xlib import display as xld
+            d = xld.Display()
+            stack = [d.screen().root]
+            wins = []
+            while stack:
+                w = stack.pop()
+                try:
+                    kids = w.query_tree().children
+                except Exception:
+                    continue
+                for c in kids:
+                    try:
+                        cls = c.get_wm_class()
+                        if (cls and cls[1] == "Menu"
+                                and re.fullmatch(r"!menu\d*",
+                                                 cls[0], re.IGNORECASE)
+                                and c.get_attributes().map_state == 2):
+                            # override-redirect のマップ済みメニュー窓
+                            # （Tk は WM_CLASS 実体を "!menu", "!menu2"... にする。
+                            #  IsViewable=2。メニュー窓は描画用子窓を1つ持つので
+                            #  子なし条件は付けられない）
+                            wins.append(c)
+                        else:
+                            stack.append(c)
+                    except Exception:
+                        continue
+            if not wins:
+                return
+            atom = d.intern_atom("_NET_WM_WINDOW_OPACITY")
+            for win in wins:  # cascade 副メニュー窓が同時マップ済みなら全て
+                if a >= 0.995:
+                    win.delete_property(atom)
+                else:
+                    # 型アトムは d.intern_atom('CARDINAL')（Xlib.X.CARDINAL は存在しない）
+                    win.change_property(atom, d.intern_atom("CARDINAL"), 32,
+                                        [int(round(a * 0xFFFFFFFF))])
+            d.flush()
+        except Exception:
+            if _PB_DEBUG:
+                import traceback
+                traceback.print_exc()
+
+    # ---- インラインメニュー（同一窓面板。wm_managed/strut 連動なし）----------
+    # 窓自身を拡大し同一 canvas 上に面板を描く。セル領域の画面座標は動かさない
+    # （本体矩形 self._body を保持し、窓原点との差を top_off / left_off に）。
+    def _menu_action(self, fn):
+        """項目選択: メニューを閉じてから動作（モード/配置/topmost 変更は窓を
+        作り直すため、面板を開いたままにできない）。"""
+        self.close_menu()
+        fn()
+
+    def _build_menu_rows(self):
+        """メニュー行を [(kind, label, cmd, checked|None, enabled)] で返す。
+        項目構成は popup 版と同一: View 切替 / (ガジェット時のみ Always on top・
+        縦横) / Items Show・Hide（n/a 無効、最後の1項目は消させない）/ Quit。"""
+        rows = [("hdr", "View", None, None, False)]
+        if self.dock:
+            rows.append(("cmd", "Gadget",
+                         lambda: self._menu_action(lambda: self.set_mode("gadget")),
+                         None, True))
+        else:
+            rows.append(("cmd", "Dock",
+                         lambda: self._menu_action(lambda: self.set_mode("dock")),
+                         None, True))
+            rows.append(("sep", "", None, None, False))
+            rows.append(("check", "Always on top",
+                         lambda: self._menu_action(
+                             lambda: self.set_topmost(
+                                 not bool(self.cfg.get("topmost", True)))),
+                         bool(self.cfg.get("topmost", True)), True))
+            horiz = self.cfg.get("orient", "h") == "h"
+            rows.append(("cmd", "Vertical" if horiz else "Horizontal",
+                         lambda: self._menu_action(
+                             lambda: self.set_orient("v" if horiz else "h")),
+                         None, True))
+        rows.append(("hdr", "Show/Hide", None, None, False))
+        names = self.ITEM_NAMES
+        n_shown = sum(1 for k in names if self.cfg["items"].get(k)
+                      and not self.all_mets[k].unavailable())
+        for key in self.cfg.get("order", names):
+            name = names[key]
+            if self.all_mets[key].unavailable():
+                rows.append(("cmd", f"{name} (n/a)", None, None, False))
+                continue
+            shown = bool(self.cfg["items"].get(key))
+            label = f"Hide {name}" if shown else f"Show {name}"
+            enabled = not (shown and n_shown <= 1)
+            # Items 切替は面板を開いたままにできる（複数項目の切り替えが楽）
+            rows.append(("cmd", label,
+                         (lambda k=key: self.toggle_item(k)) if enabled else None,
+                         None, enabled))
+        rows.append(("sep", "", None, None, False))
+        rows.append(("cmd", "Quit", self.quit, None, True))
+        return rows
+
+    def _menu_metrics(self, rows):
+        """行リストから (面板幅, 面板高) と各行の (x, y, h) を計算する。"""
+        x = MENU_PAD
+        out = []
+        total = MENU_PAD
+        wmax = 0
+        for kind, label, cmd, checked, enabled in rows:
+            h = {"hdr": MENU_HDR_H, "sep": MENU_SEP_H,
+                 "cmd": MENU_ROW_H, "check": MENU_ROW_H}[kind]
+            out.append((x, total, h))
+            total += h
+            if kind in ("cmd", "check", "hdr"):
+                prefix = "\u2713 " if kind == "check" and checked else "   "
+                w = 2 * MENU_PAD + self._mfont.measure(prefix + label)
+                wmax = max(wmax, w)
+        return max(MENU_W_MIN, wmax), total + MENU_PAD, out
+
+    def _apply_window_geom(self):
+        """本体矩形 self._body とメニュー拡大分（self._menu が dict のとき）から
+        実際の窓矩形を組み立てて geometry を適用する。メニュー閉時（popup  mode
+        を含む）は窓=本体で従来動作と同一。拡大方向: 横バーは中心が画面下半分なら
+        上、縦バーは中心が右半分なら左（逆方向に空間が無ければ反転）。"""
+        bx, by, bw, bh = self._body
+        mx, mw, mh = self.geom
+        if isinstance(self._menu, dict):
+            m = self._menu
+            if not self.vertical:
+                # 横バー: 縦へ拡大。バー中心が画面下半分なら上へ。
+                side = "above" if (by + bh / 2.0) >= mh / 2.0 else "below"
+                if side == "above" and by - m["h"] < 0:
+                    side = "below"
+                if side == "below" and by + bh + m["h"] > mh:
+                    side = "above"
+                ww = max(bw, m["w"])
+                wx = bx - (ww - bw) // 2
+                wx = max(mx, min(wx, mx + mw - ww))
+                th = bh + m["h"]
+                wy = by - m["h"] if side == "above" else by
+                m["px0"] = (ww - m["w"]) // 2
+                m["py0"] = 0 if side == "above" else bh
+            else:
+                # 縦バー: 横へ拡大。バー中心が右半分なら左へ出す。
+                side = "left" if (bx + bw / 2.0) >= mx + mw / 2.0 else "right"
+                if side == "left" and bx - m["w"] < mx:
+                    side = "right"
+                if side == "right" and bx + bw + m["w"] > mx + mw:
+                    side = "left"
+                ww = bw + m["w"]
+                th = max(bh, m["h"])
+                wx = bx - m["w"] if side == "left" else bx
+                wy = by - (th - bh) // 2
+                wy = max(0, min(wy, mh - th))
+                m["px0"] = 0 if side == "left" else bw
+                m["py0"] = (th - m["h"]) // 2
+            m["side"] = side
+            self.left_off = bx - wx
+            self.top_off = by - wy
+            if _PB_DEBUG:
+                print("[menu] win=%dx%d+%d+%d body=%s panel px0=%s py0=%s %dx%d"
+                      % (ww, th, wx, wy, self._body, m["px0"], m["py0"],
+                         m["w"], m["h"]), flush=True)
+        else:
+            ww, th, wx, wy = bw, bh, bx, by
+            self.left_off = 0
+            self.top_off = 0
+        size_changed = (ww, th) != getattr(self, "_last_win_size", None)
+        self._last_win_size = (ww, th)
+        self._win_w, self._win_h = ww, th
+        self.root.geometry(f"{ww}x{th}+{wx}+{wy}")
+        if hasattr(self, "cv"):
+            self.cv.configure(width=ww, height=th)
+        # OR 窓の bounding shape は「窓実寸」で張り直す（本体寸で ShapeSet した
+        # 形状がメニュー拡大後の窓をクリップして面板が見えない罠）。WSLg は
+        # 形状操作を使わないので触らない。
+        if self._or_mode and size_changed and not IS_WSL:
+            try:
+                dd, win = find_my_window()
+                if win is not None:
+                    apply_bounding_shape(win, ww, th, self.dock)
+                dd.close()
+            except Exception:
+                pass
+
+    def open_menu(self):
+        """バー窓を拡大してメニュー面板状態をつくり、再レイアウト＋描画。
+        ついでに別接続で pointer+keyboard grab を張り、面板外クリック/Esc を
+        拾う（grab 失敗時は focus_force + Tk バインディングにフォールバック。
+        tk_popup の grab failed と違い、握らないだけで済む）。"""
+        rows = self._build_menu_rows()
+        mw, mh, offs = self._menu_metrics(rows)
+        self._menu = {"rows": rows, "offs": offs, "w": mw, "h": mh,
+                      "hover": -1}
+        self._menu_open_at = time.monotonic()
+        self._apply_window_geom()
+        try:
+            # Esc/キー受信のため窓にフォーカスを寄せる（XSetInputFocus 直発なので
+            # OR 窓でも効く。grab が張れなかった時のフォールバック経路）。
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self._start_menu_grab()
+        self.draw()
+
+    def close_menu(self):
+        if not isinstance(self._menu, dict):
+            return
+        self._menu = None
+        # grab スレッドは alive()=False を見て grab 解除＋接続クローズで終了する。
+        self._grab_active = False
+        self._apply_window_geom()
+        self.draw()
+        # grab 解除後は焦点が旧焦点窓へ戻るため、Esc→終了 経路を生かすよう
+        # 自窓へ焦点を取り直す（OR 窓でも XSetInputFocus 直発なので効く）。
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def quit(self):
+        """終了: grab 転送フラグを下げてから窓を破棄（grab スレッドはメニュー
+        閉状態を検知して自分で grab を解く）。"""
+        self._grab_active = False
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _start_menu_grab(self):
+        import threading
+        self._grab_q = []  # 前回セッションの残り事象を捨ててから grab を張る
+        try:
+            from Xlib import display as xld
+            d = xld.Display()
+        except Exception:
+            self._grab_active = False
+            return
+        if not try_menu_grab(d, self.root.winfo_id()):
+            self._grab_active = False
+            try:
+                d.close()
+            except Exception:
+                pass
+            return
+        self._grab_active = True  # 診断用（Tk バインディング側の抑止にも使用）
+        t = threading.Thread(
+            target=menu_grab_loop,
+            args=(d, self._grab_q, lambda: self._menu is not None),
+            daemon=True)
+        t.start()
+        self.root.after(30, self._poll_menu_grab)
+
+    def _poll_menu_grab(self):
+        """grab 接続が積んだ事象を Tk ループ側で処理（30ms 間隔）。
+        grab 中はバー内外の press/motion が全部 grab 接続へ転送される（Tk
+        バインディングは発火しない＝二重処理なし）。面板ヒットテストはここ。"""
+        if not isinstance(self._menu, dict):
+            return
+        q = getattr(self, "_grab_q", None)
+        if q is None:
+            return
+        while q:
+            act = q.pop(0)
+            kind = act[0]
+            if kind == "esc":
+                self.close_menu()
+                return
+            if kind == "enter":
+                self._activate_hovered()
+                if not isinstance(self._menu, dict):
+                    return
+                continue
+            wx = act[1] - self.root.winfo_x()
+            wy = act[2] - self.root.winfo_y()
+            btn = act[3] if len(act) > 3 else 1
+            if kind == "press":
+                if btn == 3:
+                    # 再右クリック=閉じる（_open_menu と同じ判断）
+                    self.close_menu()
+                    return
+                if btn != 1:
+                    continue
+                self._menu_pick(wx, wy)
+                if not isinstance(self._menu, dict):
+                    return
+            elif kind == "motion":
+                i = self._panel_row_at(wx, wy)
+                if i != self._menu["hover"]:
+                    self._menu["hover"] = i
+                    self.draw()
+        # メニューを開いている間（Items 切替で開いたままでも）ポーリング継続
+        if isinstance(self._menu, dict):
+            self.root.after(30, self._poll_menu_grab)
+
+    def _menu_pick(self, wx, wy):
+        """窓座標の面板行を実行（行外=メニュー外クリック=閉じる）。
+        Tk バインディング（_click1）と grab 転送（_poll_menu_grab）の共通経路。"""
+        i = self._panel_row_at(wx, wy)
+        if i < 0:
+            self.close_menu()  # 面板外＝バーのセル領域クリックも外クリック扱い
+            return
+        _k, _l, cmd, _c, en = self._menu["rows"][i]
+        if en and cmd is not None:
+            cmd()
+
+    def _activate_hovered(self):
+        """Return キー: ホバー中の項目を実行（無ホバーなら何もしない）。"""
+        m = self._menu
+        if not isinstance(m, dict):
+            return
+        i = m.get("hover", -1)
+        if 0 <= i < len(m["rows"]):
+            _k, _l, cmd, _c, en = m["rows"][i]
+            if en and cmd is not None:
+                cmd()
+
+    def _rebuild_menu(self):
+        """Items 切替後、ラベル（Show/Hide）と高さを作り直して開いたまま維持。"""
+        if not isinstance(self._menu, dict):
+            return
+        rows = self._build_menu_rows()
+        mw, mh, offs = self._menu_metrics(rows)
+        self._menu.update({"rows": rows, "offs": offs, "w": mw, "h": mh,
+                           "hover": -1})
+        self._apply_window_geom()
+        self.draw()
+
+    def _panel_row_at(self, x, y):
+        """窓座標 (x,y) が面板の何行目か返す（面板外/行外は -1）。"""
+        m = self._menu
+        if not isinstance(m, dict):
+            return -1
+        px, py = m["px0"], m["py0"]
+        if not (px <= x < px + m["w"] and py <= y < py + m["h"]):
+            return -1
+        lx, ly = x - px, y - py
+        for i, (_ox, oy, h) in enumerate(m["offs"]):
+            if oy <= ly < oy + h:
+                return i
+        return -1
+
+    def _focus_out(self, e):
+        """FocusOut: 他窓へフォーカスが移った時のみ面板を閉じる。
+        grab 由来（NotifyGrab/NotifyUngrab/NotifyWhileGrabbed）や自窗内移動
+        （NotifyInferior/NotifyVirtual 等）、開直後の猶予は無視する（拾うと
+        「開いた瞬間に閉じる」）。"""
+        if not isinstance(self._menu, dict):
+            return
+        detail = getattr(e, "detail", "") or ""
+        if detail in ("NotifyGrab", "NotifyUngrab", "NotifyWhileGrabbed",
+                      "NotifyInferior", "NotifyVirtual", "NotifyPointer",
+                      "NotifyPointerRoot"):
+            return
+        if time.monotonic() - getattr(self, "_menu_open_at", 0.0) < 0.8:
+            return
+        if getattr(self, "_grab_active", False):
+            return  # grab 転送側が外クリックで閉じる（フォーカス移動と無関係）
+        self.close_menu()
+
+    def _key_esc(self, e):
+        """Esc: メニュー展開中なら閉じるだけ、閉じていなければ終了。
+        grab 成功中は grab 接続の esc 事象だけが処理する（二重発火防止）。"""
+        if getattr(self, "_grab_active", False):
+            return
+        if isinstance(self._menu, dict):
+            self.close_menu()
+            return
+        self.quit()
+
+    def _click1(self, e):
+        """左クリック: 面板内なら項目選択、面板外の窓内クリックは閉じる。
+        閉店中は通常のドラッグ開始へ。grab 成功中は grab 転送側が処理する。"""
+        if getattr(self, "_grab_active", False):
+            return
+        if isinstance(self._menu, dict):
+            self._menu_pick(e.x, e.y)
+            return
+        self._grab(e)
+
+    def _motion(self, e):
+        """ホバー行のハイライト更新（選択状態は描画時に hover idx として使う）。"""
+        if getattr(self, "_grab_active", False):
+            return
+        m = self._menu
+        if not isinstance(m, dict):
+            return
+        i = self._panel_row_at(e.x, e.y)
+        if i != m["hover"]:
+            m["hover"] = i
+            self.draw()
 
     # ---- 描画 --------------------------------------------------------------
     def draw(self):
         cv = self.cv
         cv.delete("all")
+        lo = getattr(self, "left_off", 0)
         for i, met in enumerate(self.visible_mets()):
             if self.vertical:
-                x0, y0 = 0, i * CELL_H
+                x0, y0 = lo, i * CELL_H + getattr(self, "top_off", 0)
             else:
-                x0, y0 = PAD + i * CELL_W, getattr(self, "top_off", 0)
+                x0, y0 = PAD + i * CELL_W + lo, getattr(self, "top_off", 0)
             self._draw_cell(cv, met, x0, y0)
+        self._draw_menu(cv)
+
+    def _draw_menu(self, cv):
+        """インラインメニュー面板を canvas に描く（別窓ではない。popup  mode は
+        _menu が dict でないので常に何もしない）。"""
+        m = self._menu
+        if not isinstance(m, dict):
+            return
+        px, py = m["px0"], m["py0"]
+        cv.create_rectangle(px, py, px + m["w"], py + m["h"],
+                            fill="#1c2027", outline="#4c566a")
+        for i, (kind, label, cmd, checked, enabled) in enumerate(m["rows"]):
+            _ox, oy, rh = m["offs"][i]
+            yy, yc = py + oy, py + oy + rh // 2
+            if kind == "sep":
+                cv.create_line(px + 6, yc, px + m["w"] - 6, yc, fill=GRID)
+            elif kind == "hdr":
+                cv.create_text(px + MENU_PAD + 2, yc, anchor="w", text=label,
+                               fill=OK, font=("DejaVu Sans", 8, "bold"))
+            else:
+                hovered = enabled and i == m["hover"]
+                if hovered:
+                    cv.create_rectangle(px + 2, yy + 1, px + m["w"] - 2,
+                                        yy + rh - 1, fill="#2e3440", outline="")
+                prefix = "\u2713 " if (kind == "check" and checked) else ""
+                col = FG if enabled else "#59606f"
+                if prefix:
+                    col = "#a3be8c"
+                cv.create_text(px + MENU_PAD + 2, yc, anchor="w",
+                               text=prefix + label, fill=col, font=self._mfont)
 
     def _draw_cell(self, cv, m, x0, y0):
-        ch = CELL_H if self.vertical else self.h - getattr(self, "top_off", 0)
+        # セル高は本体矩形基準（self.h=本体高さ。メニューで窓が伸びてもセルは伸びない）
+        ch = CELL_H if self.vertical else self.h
         gx0, gx1 = x0 + 4, x0 + CELL_W - 4
         label_y = y0 + 8
         top, bot = y0 + 16, y0 + ch - 2
