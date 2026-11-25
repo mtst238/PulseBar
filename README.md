@@ -1,11 +1,13 @@
 # PulseBar
 
-A slim system monitor bar for Linux desktops: CPU, GPU, RAM, VRAM, power and temperatures in one row of cells, each with a live waveform. Drops into the Linux Mint Cinnamon panel, or floats as a desktop widget — a lightweight alternative to Conky, Rainmeter-style taskbar stats, and iStat Menus.
+A compact resident system monitor bar for Linux (X11): a light always-on bar with a wide choice of items — CPU, GPU, RAM, VRAM, CPU/GPU power, CPU/GPU/SSD temps, fan, frequency, net, disk — each cell shown or hidden from the right-click menu. Drops into the Linux Mint Cinnamon panel, or floats as a desktop widget.
+
+![Embedded in the Cinnamon panel](docs/screenshot_dock.png)
 
 ![Gadget view](docs/screenshot_gadget.png)
 
 ## Requirements (tested)
-- OS: Linux Mint 22.3 (Zena), Cinnamon 6.6.9 (X11). Wayland not supported. Also runs on Windows via WSL2 + WSLg (see WSL2_README.md)
+- OS: Linux Mint 22.3 (Zena), Cinnamon 6.6.9 (X11). Linux (X11) only; no Windows / Wayland
 - Python: 3.12.3 (Tk 8.6 from `python3-tk`), venv created by `uv`
 - Python packages: psutil 7.2.2, nvidia-ml-py 13.615.71 (`pynvml`), python-xlib 0.33
 - NVIDIA driver with NVML + dedicated GPU (no NVML -> GPU metrics auto-disabled)
@@ -23,11 +25,14 @@ but is unreadable (first run, asks authorization). Manual: `sudo ./enable_cpu_po
 
 ## Display
 
-- Metrics (default order): CPU / GPU / RAM / VRAM / CPWR / GPWR / CTMP / GTMP /
-  FAN / CFRG / NET / DISK / STMP
-  - Last five (FAN/CFRG/NET/DISK/STMP) default off; enable in `items` of config.json
-  - CFRG (MHz, floor 1000) and NET/DISK (MB/s, floor 10) autoscale like GPU power;
-    NET/DISK show '1.2G' at >=1000 MB/s
+- Metrics (grouped order): CPU LOAD CFRG CPWR CTMP / GPU GCLK GPWR GTMP FAN /
+  RAM MTMP VRAM / NET DISK STMP
+  - CFRG/CPWR/FAN/NET/DISK/STMP/GCLK/LOAD/MTMP default off; enable in `items`
+    of config.json or from the right-click menu
+  - GCLK = GPU SM clock (GHz, '2.9G'), LOAD = CPU load average (1 min),
+    MTMP = DIMM (memory module) temperature (°C)
+  - CFRG/GCLK display in GHz ('2.9G'); NET/DISK (MB/s, floor 10) autoscale
+    like GPU power; NET/DISK show '1.2G' at >=1000 MB/s
 - Each cell: "waveform + current value" (waveform window ~1 min, gradient fill)
 - High load auto-highlighted: warning=orange, critical=red (thresholds: top of PulseBar.py)
 

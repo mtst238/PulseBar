@@ -2,20 +2,29 @@
 """PulseBar: CPU/GPU/メモリ/VRAM の使用率・電力・温度をコンパクトに監視するデスクトップガジェット。
 
 仕様（正本はこの docstring）:
-  - 監視項目（config.json の "items" で表示/非表示を選ぶ、順序はこの順）:
+  - 監視項目（config.json の "items" で表示/非表示を選ぶ。既定の "order" は
+      系統別グループ: CPU系(cpu load cfrg cpupower cputemp) /
+      GPU系(gpu gclk power temp fan) / メモリ系(ram memtemp vram) /
+      転送・ストレージ(net disk ssdtemp)）:
       cpu=CPU使用率, gpu=GPU使用率, ram=メモリ使用率, vram=VRAM使用率,
       power=GPU電力(W), temp=GPU温度(℃), cputemp=CPU温度(℃, k10temp/coretemp),
       cpupower=CPUパッケージ電力(W, RAPL=powercap energy_uj差分。有効化には
       enable_cpu_power.sh を sudo で1回実行。run.sh は energy_uj が読めない時
       だけ自動で pkexec/sudo 起動する)。
       fan=GPUファン回転(%, NVML FanSpeed の全デバイス max。既定 off)。
-      cfrg=CPU周波数(MHz, psutil cpu_freq。既定 off)。
+      cfrg=CPU周波数(内部MHz, psutil cpu_freq。表示は GHz に換算し '2.9G' 形式
+      固定（disp_div。ラベル接尾 G）。既定 off)。
       net=ネットワークスループット(MB/s, sent+recv の1秒差分。既定 off)。
       disk=ディスクI/Oスループット(MB/s, read+write の1秒差分。既定 off)。
       ssdtemp=SSD温度(℃, nvme Composite 優先/無ければ hwmon nvme temp1_input。
       既定 off)。
-      NVIDIA GPU がない場合は cpu/ram/cputemp/cpupower/cfrg/net/disk のみ
-      選択可。センサーが無い項目は選択不可。
+      gclk=GPU SM周波数(内部MHz, NVML ClockInfo SM の全デバイス max。表示は
+      GHz 換算 '2.9G'（disp_div。ラベル接尾 G）。既定 off)。
+      load=CPUロードアベレージ(1分値, os.getloadavg。既定 off)。
+      memtemp=メモリ(DIMM)温度(℃, hwmon spd5118 の temp1_input 全モジュール
+      max。表示ラベル MTMP。既定 off)。
+      NVIDIA GPU がない場合は cpu/ram/cputemp/cpupower/cfrg/net/disk/load/
+      memtemp のみ選択可。センサーが無い項目は選択不可。
   - 1項目1セルで「上段=ラベル+現在値 / 下段=波形」を並べる。
     数値=今の値を正確に読むため、波形=過去からの推移を直感的に把握するため。
     波形線から波形帯下端までは水平帯分割+色ブレンドの縦グラデで塗り、
@@ -129,9 +138,11 @@ DEFAULT_CONFIG = {
     "items": {"cpu": True, "gpu": True, "ram": True, "vram": True, "power": True,
               "cpupower": True, "temp": True, "cputemp": True,
               "fan": False, "cfrg": False, "net": False, "disk": False,
-              "ssdtemp": False},
-    "order": ["cpu", "gpu", "ram", "vram", "cpupower", "power", "cputemp", "temp",
-              "fan", "cfrg", "net", "disk", "ssdtemp"],
+              "ssdtemp": False, "gclk": False, "load": False, "memtemp": False},
+    "order": ["cpu", "load", "cfrg", "cpupower", "cputemp",
+              "gpu", "gclk", "power", "temp", "fan",
+              "ram", "memtemp", "vram",
+              "net", "disk", "ssdtemp"],
     "topmost": True,
     "orient": "h",
     "dock_auto": True,
@@ -243,11 +254,32 @@ def find_ssd_temp_source():
 
 SSD_TEMP = find_ssd_temp_source()
 
+
+def find_dimm_temp_sources():
+    """メモリ(DIMM)温度の読み出し経路: /sys/class/hwmon/*/name が spd5118 の
+    ディレクトリ一覧（temp1_input は m℃）。1つも無ければ []。"""
+    import glob
+    if os.environ.get("PULSEBAR_NO_SENSORS"):
+        return []
+    out = []
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            if open(d + "/name").read().strip() == "spd5118":
+                int(open(d + "/temp1_input").read().strip())  # 読めることだけ確認
+                out.append(d)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+DIMM_SENSORS = find_dimm_temp_sources()
+
 INTERVAL_MS = 1000        # 更新間隔
 _PB_DEBUG = bool(os.environ.get("PB_DEBUG"))   # 積層再主張のデバッグ出力
 HISTORY = 60              # 波形点数（=約60秒分）
 POWER_FLOOR = 100.0       # 電力スケールの下限 (W)
 CFRG_FLOOR = 1000.0       # CPU周波数スケールの下限 (MHz)
+GCLK_FLOOR = 500.0        # GPU SM周波数スケールの下限 (MHz)
 IO_FLOOR = 10.0           # ネット/ディスクI/Oスケールの下限 (MB/s)
 MB = 1024.0 * 1024.0      # 1MB
 
@@ -356,6 +388,7 @@ class Metric:
         self.fixed_max = 100.0  # %系と温度は0-100固定、電力・周波数・S/I/OはNoneで自動スケール
         self.floor = POWER_FLOOR  # 自動スケール時のスケール下限（項目ごとに設定）
         self.compact_g = False    # MB/s系: 1000超で GB/s に繰り上げ '1.2G' 表示
+        self.disp_div = 1.0       # 表示のみ除算（周波数を MHz->GHz で '2.9G' 表示等）
         self.no_sensor = False  # このPCにセンサーが無い（表示不可）
 
     def unavailable(self):
@@ -384,7 +417,7 @@ class Metric:
             return "--"
         if self.compact_g and v >= 1000.0:
             return "{:.1f}G".format(v / 1000.0)  # MB/s -> GB/s 繰り上げ
-        return self.fmt.format(v) + self.unit
+        return self.fmt.format(v / self.disp_div) + self.unit
 
     def polyline(self, gx0, gx1, top, bot):
         span = bot - top - 2
@@ -458,10 +491,16 @@ def build_metrics():
                            warn=90, crit=140),
         "fan": Metric("fan", "FAN", "%", "#8fbcbb", gpu_only=True,
                       warn=70, crit=90),
-        "cfrg": Metric("cfrg", "CFRG", "M", "#81a1c1"),
+        "cfrg": Metric("cfrg", "CFRG", "G", "#81a1c1", fmt="{:.1f}"),
         "net": Metric("net", "NET", "M", "#57c7a5"),
         "disk": Metric("disk", "DISK", "M", "#d8973c"),
         "ssdtemp": Metric("ssdtemp", "STMP", "C", "#e8e060", warn=65, crit=75),
+        "gclk": Metric("gclk", "GCLK", "G", "#7ea9d6", gpu_only=True,
+                       fmt="{:.1f}"),
+        "load": Metric("load", "LOAD", "", "#c0ca89", fmt="{:.1f}",
+                       warn=2.0 * (os.cpu_count() or 8),
+                       crit=3.0 * (os.cpu_count() or 8)),
+        "memtemp": Metric("memtemp", "MTMP", "C", "#a0c4b8", warn=75, crit=85),
     }
     if CPU_CHIP is None:
         mets["cputemp"].no_sensor = True  # CPU温度センサーが無い場合は選択不可扱い
@@ -480,10 +519,16 @@ def build_metrics():
     # （バッファ最大値と floor の大きい方でスケール）
     mets["cfrg"].fixed_max = None
     mets["cfrg"].floor = CFRG_FLOOR
+    mets["cfrg"].disp_div = 1000.0  # 内部MHzのまま表示だけGHz '2.9G'
     for k in ("net", "disk"):
         mets[k].fixed_max = None
         mets[k].floor = IO_FLOOR
         mets[k].compact_g = True  # >=1000 MB/s は GB/s に繰り上げ '1.2G'
+    mets["gclk"].fixed_max = None
+    mets["gclk"].floor = GCLK_FLOOR
+    mets["gclk"].disp_div = 1000.0  # 内部MHzのまま表示だけGHz '2.9G'
+    if not DIMM_SENSORS:
+        mets["memtemp"].no_sensor = True  # DIMM温度センサー(spd5118)が無い場合は選択不可
     return mets
 
 
@@ -523,6 +568,17 @@ def sample_gpu(mets):
         mets["gpu"].push(max(utils))
     if fans:
         mets["fan"].push(max(fans))  # ファン回転は fan の max（温度と同じ方針）
+    g = mets.get("gclk")
+    if g is not None:
+        clks = []
+        for gpu in GPUS:
+            try:
+                clks.append(float(pynvml.nvmlDeviceGetClockInfo(
+                    gpu, pynvml.NVML_CLOCK_SM)))
+            except Exception:
+                pass
+        if clks:
+            g.push(max(clks))
     if tot > 0:
         mets["vram"].push(100.0 * used / tot)
     mets["power"].push(psum)
@@ -533,6 +589,22 @@ def sample_gpu(mets):
 def sample_cpu(mets):
     mets["cpu"].push(psutil.cpu_percent(interval=None))
     mets["ram"].push(psutil.virtual_memory().percent)
+    m = mets.get("load")
+    if m is not None:
+        try:
+            m.push(os.getloadavg()[0])
+        except OSError:
+            pass
+    m = mets.get("memtemp")
+    if m is not None and DIMM_SENSORS:
+        vals = []
+        for d in DIMM_SENSORS:  # 全DIMMの max（温度項目と同じ方針）
+            try:
+                vals.append(int(open(d + "/temp1_input").read().strip()) / 1000.0)
+            except (OSError, ValueError):
+                continue
+        if vals:
+            m.push(max(vals))
     m = mets.get("cputemp")
     if m is not None and hasattr(m, "chip"):
         try:
@@ -1771,7 +1843,8 @@ class Bar:
                   "vram": "VRAM", "power": "GPU Power", "temp": "GPU Temp",
                   "cputemp": "CPU Temp", "cpupower": "CPU Power",
                   "fan": "GPU Fan", "cfrg": "CPU Freq", "net": "Network",
-                  "disk": "Disk I/O", "ssdtemp": "SSD Temp"}
+                  "disk": "Disk I/O", "ssdtemp": "SSD Temp",
+                  "gclk": "GPU Clock", "load": "CPU Load", "memtemp": "DIMM Temp"}
 
     def _open_menu(self, e):
         if self._inline_menu:
@@ -1812,7 +1885,8 @@ class Bar:
                  "vram": "VRAM", "power": "GPU Power", "temp": "GPU Temp",
                  "cputemp": "CPU Temp", "cpupower": "CPU Power",
                  "fan": "GPU Fan", "cfrg": "CPU Freq", "net": "Network",
-                 "disk": "Disk I/O", "ssdtemp": "SSD Temp"}
+                 "disk": "Disk I/O", "ssdtemp": "SSD Temp",
+                 "gclk": "GPU Clock", "load": "CPU Load", "memtemp": "DIMM Temp"}
         n_shown = sum(1 for k in names if self.cfg["items"].get(k)
                       and not self.all_mets[k].unavailable())
         for key in self.cfg.get("order", names):
