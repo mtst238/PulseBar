@@ -69,7 +69,7 @@
       中クリック: バー下の窓を前面へ巡回（重なった窓の選択）。押下点と交差する
       WM管理窓を積層順に列挙し最背面を前面へ raise（_NET_ACTIVE_WINDOW→フレーム
       Above の順）。連続クリックで候補が巡回し、直後にその窓が左ドラッグ対象になる。
-      View: いま出ていない方へ切替のみ（ガジェット中は "Dock"、
+      Layout: いま出ていない方へ切替のみ（ガジェット中は "Dock"、
             パネル中は "Gadget"。現在の表示形式の選択肢は出さない）。
             以下はガジェット時のみ: "Always on top" と、配置の切り替え先のみ
             （横配置中は "Vertical"、縦配置中は "Horizontal"）。
@@ -109,7 +109,7 @@
       inline = バー窓自身を縦/横に拡張し同一 canvas 上に面板を描く
         （別窓を作らない。他アプリの grab 妨害に強く WSLg 推奨。バー中心が
         画面下半分/右半分なら上/左、逆なら下/右へ拡張。項目構成は popup 版と
-        同一: View 切替・Always on top・縦横・Items Show/Hide・Quit）。
+        同一: Layout 切替・Always on top・縦横・Items Show/Hide・Quit）。
         展開中は別 Xlib 接続で root に pointer+keyboard grab を張り
         （grab 失敗時は focus_force + Tk バインディングにフォールバック）、
         面板外クリック/再右クリック/Esc で閉じる。Esc は展開中=閉じる、
@@ -1864,7 +1864,7 @@ class Bar:
         m = Menu(self.root, tearoff=0, bg="#1c2027", fg=FG, activebackground="#2e3440",
                  activeforeground=FG, bd=1, relief="solid", font=("DejaVu Sans", 9))
         g = Menu(m, tearoff=0)
-        m.add_cascade(label="View", menu=g)
+        m.add_cascade(label="Layout", menu=g)
         # 現在の表示形式の選択肢は出さず、切り替え先のみを出す
         if self.dock:
             g.add_command(label="Gadget", command=lambda: self.set_mode("gadget"))
@@ -1972,9 +1972,9 @@ class Bar:
 
     def _build_menu_rows(self):
         """メニュー行を [(kind, label, cmd, checked|None, enabled)] で返す。
-        項目構成は popup 版と同一: View 切替 / (ガジェット時のみ Always on top・
+        項目構成は popup 版と同一: Layout 切替 / (ガジェット時のみ Always on top・
         縦横) / Items Show・Hide（n/a 無効、最後の1項目は消させない）/ Quit。"""
-        rows = [("hdr", "View", None, None, False)]
+        rows = [("hdr", "Layout", None, None, False)]
         if self.dock:
             rows.append(("cmd", "Gadget",
                          lambda: self._menu_action(lambda: self.set_mode("gadget")),

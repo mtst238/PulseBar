@@ -38,7 +38,7 @@ but is unreadable (first run, asks authorization). Manual: `sudo ./enable_cpu_po
 
 ## Operation
 
-- Right-click: menu (View: Dock/Gadget, Always on top, orientation; Show/Hide: toggle items; Quit)
+- Right-click: menu (Layout: Dock/Gadget, Always on top, orientation; Show/Hide: toggle items; Quit)
 - Left-drag waveform: move gadget (gadget mode; saved in `geometry`)
 - Esc: quit. Externally: `kill -USR1 <pid>` toggles dock/gadget
 
