@@ -2,8 +2,6 @@
 
 A compact resident system monitor bar for Linux (X11): a light always-on bar with a wide choice of items — CPU, GPU, RAM, VRAM, CPU/GPU power, CPU/GPU/SSD temps, fan, frequency, net, disk — each cell shown or hidden from the right-click menu. Drops into the Linux Mint Cinnamon panel, or floats as a desktop widget.
 
-![Embedded in the Cinnamon panel](docs/screenshot_dock.png)
-
 ![Gadget view](docs/screenshot_gadget.png)
 
 ## Requirements (tested)
