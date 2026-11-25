@@ -1,121 +1,53 @@
 #!/usr/bin/env python3
-"""PulseBar: CPU/GPU/メモリ/VRAM の使用率・電力・温度をコンパクトに監視するデスクトップガジェット。
+"""PulseBar: compact resident system monitor bar for Linux (X11).
 
-仕様（正本はこの docstring）:
-  - 監視項目（config.json の "items" で表示/非表示を選ぶ。既定の "order" は
-      系統別グループ: CPU系(cpu load cfrg cpupower cputemp) /
-      GPU系(gpu gclk power temp fan) / メモリ系(ram memtemp vram) /
-      転送・ストレージ(net disk ssdtemp)）:
-      cpu=CPU使用率, gpu=GPU使用率, ram=メモリ使用率, vram=VRAM使用率,
-      power=GPU電力(W), temp=GPU温度(℃), cputemp=CPU温度(℃, k10temp/coretemp),
-      cpupower=CPUパッケージ電力(W, RAPL=powercap energy_uj差分。有効化には
-      enable_cpu_power.sh を sudo で1回実行。run.sh は energy_uj が読めない時
-      だけ自動で pkexec/sudo 起動する)。
-      fan=GPUファン回転(%, NVML FanSpeed の全デバイス max。既定 off)。
-      cfrg=CPU周波数(内部MHz, psutil cpu_freq。表示は GHz に換算し '2.9G' 形式
-      固定（disp_div。ラベル接尾 G）。既定 off)。
-      net=ネットワークスループット(MB/s, sent+recv の1秒差分。既定 off)。
-      disk=ディスクI/Oスループット(MB/s, read+write の1秒差分。既定 off)。
-      ssdtemp=SSD温度(℃, nvme Composite 優先/無ければ hwmon nvme temp1_input。
-      既定 off)。
-      gclk=GPU SM周波数(内部MHz, NVML ClockInfo SM の全デバイス max。表示は
-      GHz 換算 '2.9G'（disp_div。ラベル接尾 G）。既定 off)。
-      load=CPUロードアベレージ(1分値, os.getloadavg。既定 off)。
-      memtemp=メモリ(DIMM)温度(℃, hwmon spd5118 の temp1_input 全モジュール
-      max。表示ラベル MTMP。既定 off)。
-      NVIDIA GPU がない場合は cpu/ram/cputemp/cpupower/cfrg/net/disk/load/
-      memtemp のみ選択可。センサーが無い項目は選択不可。
-  - 1項目1セルで「上段=ラベル+現在値 / 下段=波形」を並べる。
-    数値=今の値を正確に読むため、波形=過去からの推移を直感的に把握するため。
-    波形線から波形帯下端までは水平帯分割+色ブレンドの縦グラデで塗り、
-    線付近が濃く下端で背景色に溶ける（塗り色は波形線と同じ負荷色に追随）。
-  - 更新間隔 1 秒、波形の表示範囲は約 60 秒（リングバッファ HISTORY 点）。
-  - 波形の縦スケール: %系と温度は 0-100 固定。電力はバッファ内の最大値と
-    POWER_FLOOR の大きい方で自動スケール。同じ自動スケール機構を CPU周波数
-    (下限 CFRG_FLOOR=1000MHz) とネット/ディスクスループット
-    (下限 IO_FLOOR=10MB/s) にも使う。
-  - 高負荷の強調: 値が warn 超で数値・波形・セル枠が警告色(橙)、crit 超で危険色(赤)。
-      cpu/gpu/ram: warn 80% crit 93% / vram: warn 90% crit 95% /
-      temp: warn 75℃ crit 88℃ / power: GPU電力上限の warn 80% crit 95%。
-  - 表示モード（config.json の "mode"）:
-      gadget = 画面前面に浮かぶコンパクトバー。左ドラッグで移動、位置は
-               config.json の geometry に保存。
-               "orient": "h"=セル横1列 / "v"=セル縦1列。
-               "topmost": true/false で積層の方針を選ぶ。
-               true  = 最前面固定（override-redirect で全ウィンドウの上）。
-               false = アクティブ順。他のアプリと同じ扱いで、後からアクティブに
-                       した窓に覆われる。覆われたバーの露出端やバー本体をクリック
-                       すると前面へ出る（実測: muffin は override-redirect を常に
-                       最前面へ回すため、この挙動には WM管理+飾りなしが必要）。
-               前面固定時、バーがパネル帯に重なる場合は「ポインタがバー矩形上に
-               あり帯のオーバレイ窓(幽霊窓)が入力を握っている間だけ」帯の窓の直上へ
-               積層を作り直し、クリックが取れるようにする（無条件の毎tick再主張は
-               Cinnamon のホバー・ポップアップを打ち消すため廃止。代償として他窓に
-               覆われた直後はマウスがバーに乗るまで1tick遅れで前面化される）。
-      dock   = 下端パネル帯の中に同一高さで埋め込む（帯の上端にドッキングし、
-               帯の高さ＝自動高さで帯の内側に収まる）。帯のアプリレットと
-               重ならない位置は dock_offset_x で調整。帯のポインタ入力は
-               コンポジタ(Cinnamon stage窓)が握るが、必要時の積層再主張
-               （maybe_reassert_stack + 幽霊窓検出）で入力を取れる。常に横1列。
-               X11 の DOCK タイプを設定（STRUT は予約しない＝作業領域を変えない）。
-               dock_auto=true（既定）なら dock_offset_x を使わず、Cinnamon の
-               D-BusEval で測る帯右側アプレット群の直前（余白6px）にバー幅で
-               右寄せ自動配置（起動時と5秒ごとに再計算、失敗時は最後の位置維持）。
-  - 操作: 右クリックでメニュー（項目名は英語）。
-      左ドラッグ: ドック時は常に、ガジェット時は上段（ラベル/数値行）プレス時に、
-      押下点真下の最前面の他ウィンドウ（WM管理フレーム。自分/override-redirect/
-      パネル・デスクトップ系は除外）を探して窓と一緒にドラッグで動かす。対象が
-      無ければ従来動作。ガジェットの波形帯領域プレス時はバー自身を動かす（従来どおり）。
-      中クリック: バー下の窓を前面へ巡回（重なった窓の選択）。押下点と交差する
-      WM管理窓を積層順に列挙し最背面を前面へ raise（_NET_ACTIVE_WINDOW→フレーム
-      Above の順）。連続クリックで候補が巡回し、直後にその窓が左ドラッグ対象になる。
-      Layout: いま出ていない方へ切替のみ（ガジェット中は "Dock"、
-            パネル中は "Gadget"。現在の表示形式の選択肢は出さない）。
-            以下はガジェット時のみ: "Always on top" と、配置の切り替え先のみ
-            （横配置中は "Vertical"、縦配置中は "Horizontal"）。
-      Show/Hide: 表示中なら "Hide <name>"、非表示なら "Show <name>"
-             （最後の1項目は非表示にできない）。
-      "Quit"。外部からも `kill -USR1 <pid>` で gadget/dock 切替。Esc で終了。
-  - config.json キー: mode(gadget|dock), items(項目キー->true/false),
-      order(表示順: 項目キーの並べ替えで表示位置を変える。右クリックメニューでは
-      変更せずこのファイルを編集する), topmost, orient(h|v),
-      dock_auto(dock で true=既定: 帯右側アプレット群の直前に自動右寄せ。
-      false: dock_offset_x 固定),
-      dock_offset_x(プライマリモニタ左端からのオフセット px),
-      dock_height(0=パネル帯の高さに自動（PANEL_H が取れない環境のみセル高さ既定40）、
-      下限34), geometry(gadget の [x,y])。
-  - 対応OS: Linux (X11)。動作確認済みは Linux Mint 22.3 (Cinnamon/muffin) のみ。
-    他ディストリビューションでは未検証。Windows は非対応（撤去）。Wayland 未対応。
-  - GPU は NVML の全デバイスを1系統に集計して表示する
-    （使用率=max, VRAM=合計使用/合計搭載, 電力=合計, 温度=max）。
-    検証用フック: PULSEBAR_NO_GPU=1 / PULSEBAR_NO_SENSORS=1 で GPU無し・
-    センサー無し構成を再現できる。
-  - WSL2 (WSLg) 対応: /proc/version に microsoft または環境変数
-    WSL_DISTRO_NAME があれば WSL 判定（環境変数 PB_PLATFORM=wsl|native で
-    手動上書き可。結果は IS_WSL）。IS_WSL 時は mode 設定によらず常に
-    ガジェット扱い（ドック計算・gdbus/cinnamon_panel_bounds は呼ばない。
-    config.json の mode は書き換えない）。overrideredirect(True) +
-    attributes('-topmost',True) の無管理窓を geometry でマップ前に配置し、
-    以後の Xlib 積層操作（maybe_reassert_stack / raise_or_below /
-    restack_above_stage / set_window_role / apply_motif_nodecor /
-    request_skip_taskbar / clear_dock_role / 裏窓ドラッグの窓ピッキング）は
-    入口で no-op。Cinnamon 専用の幽霊窓戦法は WSLg では誤作動するため。
-    ドラッグ（B1-Motion）と Esc 終了は従来通り。センサーは WSL 側から
-    見えるものだけ（GPU=WSLg の NVML。CPU温度/SSD温度/powercap は通常
-    見えず、no_sensor 扱いで自動選択不可になる）。概要は WSL2_README.md、
-    WSL 上の接続検証は wsl_selftest.py。
-  - メニュー方式（環境変数 PB_MENU=auto|popup|inline、既定 auto）:
-      popup = tk_popup で別ポップアップ窓（native 従来方式）。
-      inline = バー窓自身を縦/横に拡張し同一 canvas 上に面板を描く
-        （別窓を作らない。他アプリの grab 妨害に強く WSLg 推奨。バー中心が
-        画面下半分/右半分なら上/左、逆なら下/右へ拡張。項目構成は popup 版と
-        同一: Layout 切替・Always on top・縦横・Items Show/Hide・Quit）。
-        展開中は別 Xlib 接続で root に pointer+keyboard grab を張り
-        （grab 失敗時は focus_force + Tk バインディングにフォールバック）、
-        面板外クリック/再右クリック/Esc で閉じる。Esc は展開中=閉じる、
-        閉じている=終了。auto は native=popup / WSL=inline。native でも
-        PB_MENU=inline で同経路を試せる。WSL でも PB_MENU=popup で従来
-        ポップアップが使える。
+Spec (authoritative; details next to each implementation):
+  Metrics (toggled in config.json "items"; default "order" groups
+  CPU: cpu load cfrg cpupower cputemp / GPU: gpu gclk power temp fan /
+  memory: ram memtemp vram / IO: net disk ssdtemp):
+    cpu gpu ram vram  usage %  (multi-GPU aggregated into one bar:
+                                usage/temp/fan/clock max, power sum,
+                                vram = sum(used)/sum(total))
+    power    GPU power W (NVML sum); warn/crit = power limit 80%/95%
+    cpupower CPU package W (RAPL energy_uj 1 s diff; enable once with
+             sudo ./enable_cpu_power.sh; run.sh prompts only if needed)
+    temp cputemp ssdtemp memtemp  degC (GPU / k10temp|coretemp /
+             nvme Composite or hwmon / spd5118 DIMM max)
+    fan      GPU fan %
+    cfrg gclk  clocks, MHz internal, displayed GHz ('2.9G', disp_div)
+    load     1-min load average
+    net disk MB/s (counters 1 s diff; >=1000 shown '1.2G')
+    No NVML -> GPU metrics unselectable; missing sensor -> unselectable.
+  Cell = label + value over a ~60 s waveform (HISTORY pts, 1 s tick).
+  Waveform scale: % and degC fixed 0-100; power/clocks/IO autoscale
+  (floors POWER_FLOOR/CFRG_FLOOR/GCLK_FLOOR/IO_FLOOR). warn/crit ->
+  orange/red value, line and cell border.
+  Modes (config "mode"):
+    gadget: floating bar; left-drag moves it (saved in geometry);
+      orient h|v; topmost=true -> override-redirect always on top
+      (while the pointer is over the bar it restacks above the Cinnamon
+      panel overlay window to keep clicks); false -> WM-managed.
+    dock: embedded at the bottom panel band's top edge, band height,
+      always horizontal; X11 DOCK type, no STRUT; dock_auto (default)
+      right-aligns left of the tray applets via Cinnamon D-BusEval
+      every 5 s, else dock_offset_x; dock_height 0 = band height, min 34.
+  Mouse/keys: RMB menu = Layout (dock/gadget switch), Always on top and
+    Vertical/Horizontal (gadget only), Show/Hide <item> (last shown item
+    protected), Quit. L-drag: waveform area moves the bar (gadget);
+    label row / dock mode drags the foreign window under the cursor.
+    MB-click cycles raising overlapping windows below the bar. Esc
+    closes the menu, or quits when closed. kill -USR1 <pid> toggles
+    gadget/dock.
+  config.json keys: mode items order topmost orient dock_auto
+    dock_offset_x dock_height geometry. "order" is edited here only.
+  OS: Linux X11 only; tested on Linux Mint 22.3 (Cinnamon 6.6.9/muffin).
+  No Wayland, no Windows.
+  Env hooks: PULSEBAR_NO_GPU=1 / PULSEBAR_NO_SENSORS=1 (test configs),
+    PB_PLATFORM=wsl|native (force WSL detection),
+    PB_MENU=auto|popup|inline (auto: native=popup, WSL=inline).
+  WSL2 (WSLg): always gadget mode; all Xlib stacking ops no-op; sensors
+    limited to what WSL exposes (GPU via NVML ok, temps/power usually
+    absent -> unselectable). Details: WSL2_README.md, wsl_selftest.py.
 """
 import json
 import os
@@ -1256,18 +1188,13 @@ def request_skip_taskbar():
 
 
 def menu_grab_loop(d, actions, alive):
-    """インラインメニュー展開中に grab 接続で待機するイベントループ（grab 自体は
-    Tk スレッド側の try_menu_grab() が同期で張る）。grab を張るのは Tk とは
-    「別クライアント」の接続なので、grab 中はバー内外すべての press/motion が
-    この接続にだけ届く。press（ボタン番号付き）と motion は root 座標ごと
-    actions に積んで Tk へ転送し、面板ヒットテストは Tk 側（_poll_menu_grab）で
-    行う（Tk の同名バインディングは grab 中は発火しない＝二重処理なし）。
-    - keyboard grab は owner_events=False: OR 窓は click-to-focus で
-      フォーカスを持たないので、これが Esc の唯一確実な経路。
-    - press は押しっぱなし/drag を食わないよう release まで motion を抑止。
-    - alive() が偽（メニューが Tk 側で閉じた）になり次第 finally で grab 解除+
-      接続クローズ。50ms select で確認するので grab 寿命≈メニュー寿命。
-    - python-xlib 罠: fd は d.fd ではなく d.display.fileno()。"""
+    """Event wait loop on the grab connection while the inline menu is open
+    (the grab itself is set by try_menu_grab() on the Tk thread, from a
+    *separate* client connection, so every press/motion arrives here only;
+    they are queued into actions and hit-tested on the Tk side).
+    keyboard grab owner_events=False: the O-R bar never has focus, so this
+    is the only reliable Esc path. python-xlib pitfall: fd is
+    d.display.fileno(), not d.fd."""
     from Xlib import X
     import select
     done = False
@@ -1694,22 +1621,13 @@ class Bar:
         return x, y
 
     def maybe_reassert_stack(self):
-        """前面固定モード（dock 含む）でバーが下端パネル帯に重なっているとき、帯の
-        クリックを握るコンポジタ・オーバレイ窓の直上へ自分を作り直す。これをしないと
-        帯上にドラッグ配置した後、帯内の右クリックが stage 窓に取られて
-        バーを選択できない（実測: query_pointer の child が stage になる）。
-        ただし「無条件に毎 tick restack」は Cinnamon のホバー・ポップアップ
-        （ウィンドウ一覧のサムネイル等）を毎秒打ち消す（実測回归）。restack は
-        「実需があるときだけ」:
-          - ポインタがバー矩形（∩帯）の上にあり、なおかつ入力オーナーが自分
-            以外（=帯の幽霊窓に取られている）ときだけ restack する。
-          - オーナーが自クライアント（Tk メニュー等、id>>21 が同じ）なら restack しない。
-          - 最後に restack してから REASSERT_GRACE_S(1.5s) は猶予して継続 restack
-            （ポップアップ展開直後にポインタが一瞬バー縁に留まるケース対策）。
-        代償: 他窓に覆われた直後は、マウスがバーに乗るまで 1 tick 遅れで前面化
-        される（実操作ではマウスを寄せてからクリックするので許容）。
-        オーバレイ窓はツリーに出ないことがあるため、ポインタがバー∩帯の上にある
-        ときは query_pointer の入力オーナーで真の相手を見つけてキャッシュする。"""
+        """While the bar overlaps the bottom panel band (topmost modes),
+        restack it above the compositor overlay window that steals band
+        clicks. Only when actually needed (pointer over bar∩band and input
+        owned by a foreign window), because unconditional per-tick restack
+        kills Cinnamon hover popups. The overlay (ghost) window is found
+        via query_pointer, not query_tree. Cost: newly covered bar lifts
+        one tick late."""
         if IS_WSL:
             return  # WSLg: 幽霊窓戦法は誤作動。tick 毎の積層操作は全停止
         if not self._or_mode:
